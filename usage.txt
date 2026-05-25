@@ -1,0 +1,7 @@
+chmod +x crs_orchestrator_final.sh
+
+./crs_orchestrator_final.sh health
+./crs_orchestrator_final.sh status
+./crs_orchestrator_final.sh stop
+./crs_orchestrator_final.sh start
+./crs_orchestrator_final.sh restart
