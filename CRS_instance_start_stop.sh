@@ -46,7 +46,7 @@ set -o nounset
 # GLOBAL CONSTANTS
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly REQUIRED_USERS="oracle grid"
 
 # ---------------------------------------------------------------------------
@@ -760,7 +760,11 @@ action_stop_all() {
         printf "\n${C_YELLOW}Stopping database: %s${C_RESET}\n" "${_db}"
         audit_log "[ACTION] Stopping database ${_db} (instance ${_sid})"
         run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop database -d '${_db}' -o immediate"
-        if [ "${DRY_RUN}" -ne 1 ]; then
+        # Verify and capture post-stop status regardless of dry-run;
+        # these are read-only observations that always provide value.
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
+        else
             verify_database_state "${_oh}" "${_db}" "stopped"
             log_db_status "${_oh}" "${_db}" "POST-STOP Verify"
         fi
@@ -771,7 +775,7 @@ action_stop_all() {
     printf "\n${C_YELLOW}Stopping Oracle CRS stack...${C_RESET}\n"
     audit_log "[ACTION] Stopping CRS stack"
     run_cmd "'${CRSCTL}' stop crs"
-    # Note: crsctl check crs is not callable after CRS stops; log the intent
+    # crsctl check crs cannot run after CRS stops; log the intent only.
     audit_log "[ACTION-COMPLETE] CRS stop command issued; cluster stack halted."
     log_ok "Stop-all sequence completed."
     audit_log "[ACTION-DONE] STOP_ALL complete on node ${LOCAL_NODE}"
@@ -789,10 +793,11 @@ action_start_all() {
     audit_log "[ACTION] Starting CRS stack"
     run_cmd "'${CRSCTL}' start crs"
 
-    if [ "${DRY_RUN}" -ne 1 ]; then
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        log_warn "[DRY-RUN] Skipping CRS verify and stabilisation wait (no actual start was issued)."
+    else
         verify_crs_state "active" 300
         log_crs_status "POST-CRS-START Status"
-
         log_info "Waiting 60 seconds for CRS to fully stabilise..."
         audit_log "[WAIT] 60s CRS stabilisation pause"
         sleep 60
@@ -807,7 +812,9 @@ action_start_all() {
         printf "\n${C_YELLOW}Starting database: %s${C_RESET}\n" "${_db}"
         audit_log "[ACTION] Starting database ${_db}"
         run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' start database -d '${_db}'"
-        if [ "${DRY_RUN}" -ne 1 ]; then
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            log_warn "[DRY-RUN] Skipping post-start verify/status (no actual start was issued)."
+        else
             verify_database_state "${_oh}" "${_db}" "running"
             log_db_status "${_oh}" "${_db}" "POST-START Verify"
         fi
@@ -818,9 +825,13 @@ action_start_all() {
     audit_log "[ACTION-DONE] START_ALL complete on node ${LOCAL_NODE}"
 
     # ── SNAPSHOT COMPARISON ───────────────────────────────────────────────
-    if [ "${DRY_RUN}" -ne 1 ] && [ -f "${PRE_SNAP_CRS}" ]; then
+    # Snapshots are read-only; always take and compare if a baseline exists,
+    # even in dry-run mode (the pre-snap was taken before the stop).
+    if [ -f "${PRE_SNAP_CRS}" ]; then
         take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-START"
         compare_snapshots
+    else
+        log_warn "No pre-stop snapshot found; skipping comparison (was stop issued separately?)."
     fi
 }
 
@@ -891,22 +902,23 @@ action_stop_specific() {
         0) return ;;
 
         1)  # ── STOP INSTANCE ────────────────────────────────────────────
-            # Pre-stop status
             log_section "PRE-STOP Instance Status"
             log_inst_status "${_oh}" "${_db}" "${_sid}" "PRE-STOP"
             take_snapshot "${PRE_SNAP_CRS}" "${PRE_SNAP_DB}" "PRE-STOP"
 
             printf "${C_RED}Stopping instance '${_sid}' on '${LOCAL_NODE}'...${C_RESET}\n"
             audit_log "[ACTION] srvctl stop instance db=${_db} sid=${_sid}"
-            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop instance \
-                     -d '${_db}' -i '${_sid}' -o immediate"
+            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop instance -d '${_db}' -i '${_sid}' -o immediate"
 
-            if [ "${DRY_RUN}" -ne 1 ]; then
-                # Post-stop verification
+            if [ "${DRY_RUN}" -eq 1 ]; then
+                log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
+            else
                 verify_instance_state "${_oh}" "${_db}" "${_sid}" "stopped"
                 log_section "POST-STOP Instance Status"
                 log_inst_status "${_oh}" "${_db}" "${_sid}" "POST-STOP Verify"
             fi
+            take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-STOP"
+            compare_snapshots
             log_ok "Instance '${_sid}' stop sequence complete."
             ;;
 
@@ -925,14 +937,17 @@ action_stop_specific() {
 
             printf "${C_RED}Stopping entire database '${_db}'...${C_RESET}\n"
             audit_log "[ACTION] srvctl stop database db=${_db}"
-            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop database \
-                     -d '${_db}' -o immediate"
+            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop database -d '${_db}' -o immediate"
 
-            if [ "${DRY_RUN}" -ne 1 ]; then
+            if [ "${DRY_RUN}" -eq 1 ]; then
+                log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
+            else
                 verify_database_state "${_oh}" "${_db}" "stopped"
                 log_section "POST-STOP Database Status"
                 log_db_status "${_oh}" "${_db}" "POST-STOP Verify"
             fi
+            take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-STOP"
+            compare_snapshots
             log_ok "Database '${_db}' stop sequence complete."
             ;;
 
@@ -975,45 +990,47 @@ action_start_specific() {
         1)  # ── START INSTANCE ───────────────────────────────────────────
             log_section "PRE-START Instance Status"
             log_inst_status "${_oh}" "${_db}" "${_sid}" "PRE-START"
+            take_snapshot "${PRE_SNAP_CRS}" "${PRE_SNAP_DB}" "PRE-START"
 
             printf "${C_GREEN}Starting instance '${_sid}' on '${LOCAL_NODE}'...${C_RESET}\n"
             audit_log "[ACTION] srvctl start instance db=${_db} sid=${_sid}"
-            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' start instance \
-                     -d '${_db}' -i '${_sid}'"
+            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' start instance -d '${_db}' -i '${_sid}'"
 
-            if [ "${DRY_RUN}" -ne 1 ]; then
+            if [ "${DRY_RUN}" -eq 1 ]; then
+                log_warn "[DRY-RUN] Skipping post-start verify/status (no actual start was issued)."
+            else
                 verify_instance_state "${_oh}" "${_db}" "${_sid}" "running"
                 log_section "POST-START Instance Status"
                 log_inst_status "${_oh}" "${_db}" "${_sid}" "POST-START Verify"
             fi
+            take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-START"
+            compare_snapshots
             log_ok "Instance '${_sid}' start sequence complete."
             ;;
 
         2)  # ── START DATABASE (ALL NODES) ────────────────────────────────
             log_section "PRE-START Database Status"
             log_db_status "${_oh}" "${_db}" "PRE-START"
+            take_snapshot "${PRE_SNAP_CRS}" "${PRE_SNAP_DB}" "PRE-START"
 
             printf "${C_GREEN}Starting entire database '${_db}'...${C_RESET}\n"
             audit_log "[ACTION] srvctl start database db=${_db}"
-            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' start database \
-                     -d '${_db}'"
+            run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' start database -d '${_db}'"
 
-            if [ "${DRY_RUN}" -ne 1 ]; then
+            if [ "${DRY_RUN}" -eq 1 ]; then
+                log_warn "[DRY-RUN] Skipping post-start verify/status (no actual start was issued)."
+            else
                 verify_database_state "${_oh}" "${_db}" "running"
                 log_section "POST-START Database Status"
                 log_db_status "${_oh}" "${_db}" "POST-START Verify"
             fi
+            take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-START"
+            compare_snapshots
             log_ok "Database '${_db}' start sequence complete."
             ;;
 
         *)  log_error "Invalid option: '${_opt}'"; return ;;
     esac
-
-    # Snapshot comparison if we have a prior baseline
-    if [ "${DRY_RUN}" -ne 1 ] && [ -f "${PRE_SNAP_CRS}" ]; then
-        take_snapshot "${POST_SNAP_CRS}" "${POST_SNAP_DB}" "POST-START"
-        compare_snapshots
-    fi
 
     audit_log "[ACTION-DONE] START SPECIFIC complete: db=${_db} sid=${_sid}"
 }
