@@ -46,7 +46,7 @@ set -o nounset
 # GLOBAL CONSTANTS
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="3.0.1"
+readonly SCRIPT_VERSION="3.0.2"
 readonly REQUIRED_USERS="oracle grid"
 
 # ---------------------------------------------------------------------------
@@ -176,8 +176,11 @@ close_audit_log() {
 # Strip ANSI sequences when writing to log using tr/sed
 # ---------------------------------------------------------------------------
 _strip_ansi() {
-    # Remove ESC [ ... m sequences (POSIX sed with BRE)
-    printf '%s' "$*" | sed 's/\x1b\[[0-9;]*m//g; s/\\033\[[0-9;]*m//g'
+    # Remove ANSI escape sequences in a Solaris-safe way.
+    # tr deletes the raw ESC character (octal 033); sed then cleans up
+    # any residual "[0-9;]*m" fragments left behind.  Both tools use only
+    # POSIX BRE / basic character classes -- no \x1b hex escapes.
+    printf '%s' "$*" | tr -d '\033' | sed 's/\[[0-9;]*m//g'
 }
 
 log_info() {
@@ -283,16 +286,17 @@ verify_instance_state() {
     while [ "${_elapsed}" -lt "${_timeout}" ]; do
         _out=$(ORACLE_HOME="${_voh}" "${_voh}/bin/srvctl" status instance \
                -d "${_vdb}" -i "${_vsid}" 2>&1)
-        _match=$(printf '%s' "${_out}" | grep -i "${_expect}" | head -1)
+        # grep -i handles multi-word phrases like "not running" correctly
+        _match=$(printf '%s\n' "${_out}" | grep -i "${_expect}" | head -1)
         if [ -n "${_match}" ]; then
-            log_ok "VERIFIED: Instance '${_vsid}' is ${_expect} (elapsed ${_elapsed}s)."
+            log_ok "VERIFIED: Instance '${_vsid}' is '${_expect}' (elapsed ${_elapsed}s)."
             audit_log "[VERIFY-PASS] instance=${_vsid} state=${_expect} elapsed=${_elapsed}s"
             audit_log "[VERIFY-OUT]  ${_out}"
             return 0
         fi
         sleep "${STATUS_POLL_INTERVAL}"
         _elapsed=$((_elapsed + STATUS_POLL_INTERVAL))
-        log_info "  Still waiting... (${_elapsed}/${_timeout}s) – current: ${_out}"
+        log_info "  Still waiting... (${_elapsed}/${_timeout}s) -- current: ${_out}"
     done
 
     log_error "VERIFY FAILED: Instance '${_vsid}' did NOT reach '${_expect}' within ${_timeout}s."
@@ -312,20 +316,20 @@ verify_database_state() {
     while [ "${_elapsed}" -lt "${_timeout}" ]; do
         _out=$(ORACLE_HOME="${_voh}" "${_voh}/bin/srvctl" status database \
                -d "${_vdb}" -v 2>&1)
-        # All lines must contain the expected keyword for a database-level check
-        _total=$(printf '%s\n' "${_out}" | grep -c 'Instance\|instance' 2>/dev/null || printf '0')
-        _matched=$(printf '%s\n' "${_out}" | grep -i "${_expect}" | grep -c 'Instance\|instance' 2>/dev/null || printf '0')
+        # Count lines that mention an instance, and those that also contain
+        # the expected state phrase.  Works for both "running" and "not running".
+        _total=$(printf '%s\n' "${_out}" | grep -i 'instance' | wc -l | tr -d ' ')
+        _matched=$(printf '%s\n' "${_out}" | grep -i 'instance' | grep -i "${_expect}" | wc -l | tr -d ' ')
         if [ "${_total}" -gt 0 ] && [ "${_matched}" -eq "${_total}" ]; then
-            log_ok "VERIFIED: All instances of '${_vdb}' are ${_expect} (elapsed ${_elapsed}s)."
+            log_ok "VERIFIED: All instances of '${_vdb}' are '${_expect}' (elapsed ${_elapsed}s)."
             audit_log "[VERIFY-PASS] database=${_vdb} state=${_expect} elapsed=${_elapsed}s"
             audit_log "[VERIFY-OUT]  ${_out}"
             return 0
         fi
-        # Partial match — show which instances are not yet in desired state
-        _not_matched=$(printf '%s\n' "${_out}" | grep -v -i "${_expect}" | grep -i 'Instance\|instance')
+        _not_matched=$(printf '%s\n' "${_out}" | grep -i 'instance' | grep -vi "${_expect}")
         sleep "${STATUS_POLL_INTERVAL}"
         _elapsed=$((_elapsed + STATUS_POLL_INTERVAL))
-        log_info "  Still waiting... (${_elapsed}/${_timeout}s) – not yet ${_expect}: ${_not_matched}"
+        log_info "  Still waiting... (${_elapsed}/${_timeout}s) – not yet '${_expect}': ${_not_matched}"
     done
 
     log_error "VERIFY FAILED: Database '${_vdb}' did NOT fully reach '${_expect}' within ${_timeout}s."
@@ -751,22 +755,21 @@ action_stop_all() {
     done
     take_snapshot "${PRE_SNAP_CRS}" "${PRE_SNAP_DB}" "PRE-STOP"
 
-    # ── STOP DATABASES ───────────────────────────────────────────────────
+    # ── STOP LOCAL INSTANCES ─────────────────────────────────────────────
+    # Stop only the LOCAL instance on this node, not all nodes.
     _i=1
     while [ "${_i}" -le "${DB_COUNT}" ]; do
         eval "_oh=\${DB_HOME_${_i}}"
         eval "_db=\${DB_NAME_${_i}}"
         eval "_sid=\${DB_SID_${_i}}"
-        printf "\n${C_YELLOW}Stopping database: %s${C_RESET}\n" "${_db}"
-        audit_log "[ACTION] Stopping database ${_db} (instance ${_sid})"
-        run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop database -d '${_db}' -o immediate"
-        # Verify and capture post-stop status regardless of dry-run;
-        # these are read-only observations that always provide value.
+        printf "\n${C_YELLOW}Stopping local instance: %s (db: %s)${C_RESET}\n" "${_sid}" "${_db}"
+        audit_log "[ACTION] Stopping local instance ${_sid} of database ${_db}"
+        run_cmd "ORACLE_HOME='${_oh}' '${_oh}/bin/srvctl' stop instance -d '${_db}' -i '${_sid}' -o immediate"
         if [ "${DRY_RUN}" -eq 1 ]; then
             log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
         else
-            verify_database_state "${_oh}" "${_db}" "stopped"
-            log_db_status "${_oh}" "${_db}" "POST-STOP Verify"
+            verify_instance_state "${_oh}" "${_db}" "${_sid}" "not running"
+            log_inst_status "${_oh}" "${_db}" "${_sid}" "POST-STOP Verify"
         fi
         _i=$((_i + 1))
     done
@@ -913,7 +916,7 @@ action_stop_specific() {
             if [ "${DRY_RUN}" -eq 1 ]; then
                 log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
             else
-                verify_instance_state "${_oh}" "${_db}" "${_sid}" "stopped"
+                verify_instance_state "${_oh}" "${_db}" "${_sid}" "not running"
                 log_section "POST-STOP Instance Status"
                 log_inst_status "${_oh}" "${_db}" "${_sid}" "POST-STOP Verify"
             fi
@@ -942,7 +945,7 @@ action_stop_specific() {
             if [ "${DRY_RUN}" -eq 1 ]; then
                 log_warn "[DRY-RUN] Skipping post-stop verify/status (no actual stop was issued)."
             else
-                verify_database_state "${_oh}" "${_db}" "stopped"
+                verify_database_state "${_oh}" "${_db}" "not running"
                 log_section "POST-STOP Database Status"
                 log_db_status "${_oh}" "${_db}" "POST-STOP Verify"
             fi
