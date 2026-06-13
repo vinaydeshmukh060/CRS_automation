@@ -170,10 +170,10 @@ fi
 # 4. COUNT FAILED CUSTOM OEM JOBS IN THE LAST 24 HOURS
 ############################################################
 #
-# NOTE: MGMT$JOB_EXECUTION_HISTORY.STATUS representation can differ
-# between OEM repository versions (text vs numeric code). Run
-#   DESC SYSMAN.MGMT$JOB_EXECUTION_HISTORY
-# in the resolved container/PDB and adjust the predicate below if needed.
+# Per the Enterprise Manager Cloud Control Repository Views Reference,
+# MGMT$JOB_EXECUTION_HISTORY.STATUS is a VARCHAR2 and 'Failed' is a valid
+# value meaning one or more steps of the execution failed, so the
+# predicate below (h.status = 'Failed') is correct as written.
 #-------------------------------------------------------------
 
 FAILED_COUNT=`sqlplus -s /nolog <<EOSQL | tr -d '[:space:]'
@@ -220,6 +220,8 @@ SET TRIMOUT    ON
 SET WRAP       OFF
 SET PAGESIZE   50000
 SET LINESIZE   32767
+SET LONG       4000
+SET LONGCHUNKSIZE 4000
 
 SET MARKUP HTML ON HEAD '<title>OEM Custom Job Failure Report - ${ORACLE_SID} - ${TIMESTAMP}</title><style type="text/css"> body {font-family: Arial, Helvetica, sans-serif; font-size: 13px; color:#333333;} h1 {color:#cc0000; font-size:18px;} table {border-collapse: collapse; width:100%; margin-top:10px;} th {background-color:#cc0000; color:#ffffff; padding:6px 8px; text-align:left; border:1px solid #990000;} td {border:1px solid #cccccc; padding:6px 8px; vertical-align:top;} tr:nth-child(even) td {background-color:#f7f7f7;}</style>' BODY '' TABLE 'border="1" cellpadding="4" cellspacing="0"' ENTMAP ON SPOOL ON
 
@@ -235,13 +237,22 @@ SPOOL ${REPORT_FILE}
 PROMPT <h1>OEM Custom Job Failure Report</h1>
 PROMPT <p>Instance: ${ORACLE_SID} &nbsp;|&nbsp; Failed job executions with a start time within the last 24 hours (SYSDATE - 1).</p>
 
+-- NOTE: MGMT$JOB_EXECUTION_HISTORY has no ERROR_MSG column. The failure
+-- detail comes from the failed step's OUTPUT in MGMT$JOB_STEP_HISTORY.
+-- The scalar subquery below returns the output of the (first) failed
+-- step for each execution, truncated to 4000 chars.
 SELECT
        j.job_name                                       AS "Job Name",
        j.job_owner                                      AS "Owner",
        h.status                                         AS "Status",
        TO_CHAR(h.start_time, 'YYYY-MM-DD HH24:MI:SS')    AS "Start Time",
        TO_CHAR(h.end_time,   'YYYY-MM-DD HH24:MI:SS')    AS "End Time",
-       h.error_msg                                      AS "Error Message"
+       (SELECT SUBSTR(s.output, 1, 4000)
+          FROM SYSMAN.MGMT\$JOB_STEP_HISTORY s
+         WHERE s.job_id       = h.job_id
+           AND s.execution_id = h.execution_id
+           AND s.status       = 'Failed'
+           AND ROWNUM = 1)                               AS "Error Message"
 FROM   SYSMAN.MGMT\$JOB j,
        SYSMAN.MGMT\$JOB_EXECUTION_HISTORY h
 WHERE  j.job_id     = h.job_id
