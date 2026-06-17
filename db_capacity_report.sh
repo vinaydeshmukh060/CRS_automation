@@ -27,9 +27,11 @@ ASM_CSV="${PREFIX}_asm.csv"
 HTML_OUT="${PREFIX}.html"
 SQL_FILE="/tmp/run_report_$$.sql"
 
-# Clear/Initialize master CSVs
-> "$TS_CSV"
-> "$ASM_CSV"
+# Temporary raw data files
+TMP_TS_DATA="/tmp/__ts_data_all_$$.csv"
+TMP_ASM_DATA="/tmp/__asm_data_all_$$.csv"
+> "$TMP_TS_DATA"
+> "$TMP_ASM_DATA"
 
 # ------------------------------------------------------------------------------
 # 1. Instance Auto-Discovery & Environment Setup
@@ -53,13 +55,11 @@ set_oracle_env() {
     export ORACLE_SID=$sid
     export ORAENV_ASK=NO
     
-    # Try standard oraenv locations
     if command -v oraenv >/dev/null 2>&1; then
         . oraenv > /dev/null 2>&1
     elif [ -f /usr/local/bin/oraenv ]; then
         . /usr/local/bin/oraenv > /dev/null 2>&1
     else
-        # Fallback to parsing oratab (Linux/Solaris paths)
         local oratab_file=""
         [ -f /etc/oratab ] && oratab_file="/etc/oratab"
         [ -f /var/opt/oracle/oratab ] && oratab_file="/var/opt/oracle/oratab"
@@ -74,7 +74,7 @@ set_oracle_env() {
 }
 
 # ------------------------------------------------------------------------------
-# 2. Define the Oracle SQL Query
+# 2. Define the Bulletproof Oracle SQL Query
 # ------------------------------------------------------------------------------
 cat << 'EOF' > "$SQL_FILE"
 SET MARKUP CSV ON DELIMITER ',' QUOTE OFF
@@ -83,31 +83,45 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
 
 -- Tablespace Report
 SPOOL __ts_output.csv
-WITH db_info AS ( SELECT name AS db_name FROM v$database ),
+WITH db_info AS ( 
+    SELECT name AS db_name, dbid FROM v$database 
+),
+ts_mapping AS (
+    -- Safely maps TS# across all PDBs (v$tablespace can drop PDBs if run from root)
+    SELECT DISTINCT d.ts#, d.con_id, c.tablespace_name, c.block_size
+    FROM v$datafile d
+    JOIN cdb_data_files c ON d.file# = c.file_id AND d.con_id = c.con_id
+),
 ts_current AS (
     SELECT ts.con_id, ts.tablespace_name, COUNT(df.file_id) AS datafile_count,
            ROUND(SUM(df.bytes) / 1024/1024/1024, 2) AS allocated_gb,
            ROUND((SUM(df.bytes) - NVL(MAX(free.free_bytes), 0)) / 1024/1024/1024, 2) AS used_gb,
-           ROUND(NVL(MAX(free.free_bytes), 0) / 1024/1024/1024, 2) AS free_gb, ts.block_size
+           ROUND(NVL(MAX(free.free_bytes), 0) / 1024/1024/1024, 2) AS free_gb
     FROM cdb_tablespaces ts
     JOIN cdb_data_files df ON ts.tablespace_name = df.tablespace_name AND ts.con_id = df.con_id
     LEFT JOIN ( SELECT con_id, tablespace_name, SUM(bytes) AS free_bytes FROM cdb_free_space GROUP BY con_id, tablespace_name ) free 
     ON free.tablespace_name = ts.tablespace_name AND free.con_id = ts.con_id
-    GROUP BY ts.con_id, ts.tablespace_name, ts.block_size
+    GROUP BY ts.con_id, ts.tablespace_name
 ),
 ts_with_capacity AS (
     SELECT con_id, tablespace_name, datafile_count, allocated_gb, used_gb, free_gb,
            CASE WHEN datafile_count < 1023 THEN (1023 - datafile_count) * 32 ELSE 0 END AS addable_gb
     FROM ts_current
 ),
-ts_snap AS (
-    SELECT v.con_id, v.name AS tablespace_name, TRUNC(s.begin_interval_time, 'IW') AS week_start_date,
-           s.begin_interval_time AS snap_time, (u.tablespace_usedsize * dt.block_size) AS used_bytes
-    FROM dba_hist_tbspc_space_usage u
-    JOIN dba_hist_snapshot s ON s.snap_id = u.snap_id AND s.dbid = u.dbid AND s.instance_number = u.instance_number
-    JOIN v$tablespace v ON v.ts# = u.tablespace_id AND v.con_id = u.con_id
-    JOIN cdb_tablespaces dt ON dt.tablespace_name = v.name AND dt.con_id = v.con_id
+snap_times AS (
+    -- Locks to current DBID to prevent duplication from older db incarnations
+    SELECT s.snap_id, s.dbid, MAX(s.begin_interval_time) AS snap_time, TRUNC(MAX(s.begin_interval_time), 'IW') AS week_start_date
+    FROM dba_hist_snapshot s
+    JOIN db_info db ON s.dbid = db.dbid
     WHERE s.end_interval_time >= SYSTIMESTAMP - NUMTODSINTERVAL(26*7, 'DAY')
+    GROUP BY s.snap_id, s.dbid
+),
+ts_snap AS (
+    SELECT m.con_id, m.tablespace_name, s.week_start_date, s.snap_time,
+           (u.tablespace_usedsize * m.block_size) AS used_bytes
+    FROM dba_hist_tbspc_space_usage u
+    JOIN snap_times s ON s.snap_id = u.snap_id AND s.dbid = u.dbid
+    JOIN ts_mapping m ON m.ts# = u.tablespace_id AND m.con_id = u.con_id
 ),
 daily_last_snap AS (
     SELECT con_id, tablespace_name, week_start_date, TRUNC(snap_time) AS snap_date, used_bytes,
@@ -151,10 +165,8 @@ EXIT;
 EOF
 
 # ------------------------------------------------------------------------------
-# 3. Execute Loop & Aggregate Data
+# 3. Execute Loop & Strip SQL Headers strictly via Bash
 # ------------------------------------------------------------------------------
-IS_FIRST_RUN=1
-
 for SID in $TARGET_SIDS; do
     echo "Processing Instance: $SID..."
     set_oracle_env "$SID"
@@ -162,30 +174,29 @@ for SID in $TARGET_SIDS; do
     # Execute SQL
     sqlplus -s / as sysdba @"$SQL_FILE" > /dev/null
     
-    # Append to Master CSVs (handling headers)
-    if [ -s __ts_output.csv ]; then
-        if [ $IS_FIRST_RUN -eq 1 ]; then
-            cat __ts_output.csv > "$TS_CSV"
-            cat __asm_output.csv > "$ASM_CSV"
-            IS_FIRST_RUN=0
-        else
-            tail -n +2 __ts_output.csv >> "$TS_CSV"
-            tail -n +2 __asm_output.csv >> "$ASM_CSV"
-        fi
+    # Strip SQL Headers completely to prevent mid-file duplicates
+    if [ -f __ts_output.csv ]; then
+        grep -v "^CONTAINER_NAME" __ts_output.csv | grep -v "^$" >> "$TMP_TS_DATA"
+    fi
+    if [ -f __asm_output.csv ]; then
+        grep -v "^DISKGROUP_NAME" __asm_output.csv | grep -v "^$" >> "$TMP_ASM_DATA"
     fi
     rm -f __ts_output.csv __asm_output.csv
 done
 rm -f "$SQL_FILE"
 
-# Deduplicate ASM output (since multiple DBs on the same host see the same diskgroups)
-if [ -s "$ASM_CSV" ]; then
-    head -n 1 "$ASM_CSV" > __tmp_asm.csv
-    tail -n +2 "$ASM_CSV" | sort -t, -u >> __tmp_asm.csv
-    mv __tmp_asm.csv "$ASM_CSV"
-fi
+# Apply hardcoded single header to Final CSVs
+echo "CONTAINER_NAME,TABLESPACE_NAME,DATAFILE_COUNT,ALLOCATED_GB,USED_GB,FREE_GB,ADDABLE_GB,AVG_WEEKLY_GROWTH_GB,VOLATILITY,SUSTAINABLE_WEEKS,ALERT_COLOR" > "$TS_CSV"
+cat "$TMP_TS_DATA" >> "$TS_CSV"
+
+echo "DISKGROUP_NAME,STATE,REDUNDANCY_TYPE,TOTAL_GB,FREE_GB,USED_GB,PCT_USED" > "$ASM_CSV"
+# Deduplicate ASM cleanly (Using Sort Unique on raw data)
+sort -t, -u "$TMP_ASM_DATA" >> "$ASM_CSV"
+
+rm -f "$TMP_TS_DATA" "$TMP_ASM_DATA"
 
 # ------------------------------------------------------------------------------
-# 4. Generate Interactive HTML Dashboard via AWK (CSS & JS Embedded)
+# 4. Generate Interactive HTML Dashboard via AWK
 # ------------------------------------------------------------------------------
 AWK_CMD="awk"
 if command -v nawk >/dev/null 2>&1; then AWK_CMD="nawk"; fi
@@ -351,8 +362,3 @@ if [ -n "$EMAIL_TO" ]; then
 else
     echo "Report generated locally."
 fi
-
-echo "Summary of generated files:"
-echo "  - Dashboard: $HTML_OUT"
-echo "  - TS Data:   $TS_CSV"
-echo "  - ASM Data:  $ASM_CSV"
