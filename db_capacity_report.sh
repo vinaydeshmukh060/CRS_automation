@@ -2,7 +2,8 @@
 #==============================================================================
 # tbsp_report.sh
 #
-# Oracle Tablespace Capacity & Growth Report (+ ASM diskgroup space)
+# Oracle Tablespace Capacity & Growth Report (+ ASM diskgroup space), with
+# optional emailing of the result.
 # ---------------------------------------------------------------------------
 # Portable across Solaris (SunOS) and Linux. CDB/non-CDB aware (Oracle 19c+).
 #
@@ -12,6 +13,16 @@
 #   <tag>_capacity_report_<ts>.html  - interactive HTML report (both sections)
 #   <tag>_capacity_report_<ts>.log   - run log
 #
+# ASM diskgroup space is read from V$ASM_DISKGROUP via the same connection
+# as everything else - the database instance's ASMB process mirrors this
+# metadata for the diskgroups it actually uses, so no separate "/ as
+# sysasm" connection to the ASM/grid instance is needed (and on most sites
+# the DBA running this has no OS access to the grid home anyway).
+#
+# Emailing is optional: pass -r to also send the CSV(s)/HTML as attachments
+# once they're written, with a short plain-text summary in the body (no
+# HTML dump in the body). Without -r, nothing is emailed.
+#
 # See README.md for full documentation, assumptions and prerequisites.
 #
 # Usage: tbsp_report.sh [options]
@@ -20,24 +31,26 @@
 #   -p PDB_NAME     For a CDB, restrict report to one PDB (default: ALL)
 #   -o OUTDIR       Output directory (default: current directory)
 #   -N TAG          Tag appended to CSV/HTML filenames and report title
-#   -a ASM_SID      Override ASM instance SID autodetection
-#   -A CONNECT_STR  SQL*Plus connect string for ASM (default: "/ as sysasm")
 #   -x              Skip the ASM diskgroup section entirely
+#   -r RECIPIENTS   Comma-separated email recipients - if given, email the
+#                    report after generating it
+#   -f FROM_ADDR    From address for the email (default <user>@<hostname>)
 #   -h              Show this help and exit
 #
 # Exit codes: 0 ok, 1 usage/arg error, 2 environment/prereq error,
 #             3 tablespace query failed (fatal), 4 partial (ASM section
-#             skipped/failed but tablespace report completed).
+#             skipped/failed but tablespace report completed), 5 report
+#             completed but -r was given and the email send failed.
 #==============================================================================
 
 # ---------------------------------------------------------------------------
 # Strict-ish mode. We intentionally do NOT use 'set -e': several steps (ASM
-# detection, ASM query) are allowed to fail without aborting the whole run.
+# query, email send) are allowed to fail without aborting the whole run.
 # ---------------------------------------------------------------------------
 set -u
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
 RUN_TS=$(date +%Y%m%d_%H%M%S)
 RUN_PID=$$
 
@@ -49,9 +62,9 @@ CONNECT_STR="/ as sysdba"
 PDB_FILTER="ALL"
 OUTDIR="."
 TAG=""
-ASM_SID_OPT=""
-ASM_CONNECT_STR="/ as sysasm"
 SKIP_ASM=0
+RECIPIENTS=""
+FROM_ADDR=""
 
 # Business rules carried over verbatim from the source query. Adjust here if
 # your standards differ (e.g. a different max-datafiles-per-tablespace policy).
@@ -71,7 +84,7 @@ LOGFILE=""
 # Generic helpers
 # ===========================================================================
 usage() {
-    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 ts_now() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -169,16 +182,16 @@ set_oracle_env_for_sid() {
 # ===========================================================================
 # Argument parsing
 # ===========================================================================
-while getopts ":s:c:p:o:N:a:A:xh" opt; do
+while getopts ":s:c:p:o:N:xr:f:h" opt; do
     case "$opt" in
         s) ORACLE_SID_OPT=$OPTARG ;;
         c) CONNECT_STR=$OPTARG ;;
         p) PDB_FILTER=$OPTARG ;;
         o) OUTDIR=$OPTARG ;;
         N) TAG=$OPTARG ;;
-        a) ASM_SID_OPT=$OPTARG ;;
-        A) ASM_CONNECT_STR=$OPTARG ;;
         x) SKIP_ASM=1 ;;
+        r) RECIPIENTS=$OPTARG ;;
+        f) FROM_ADDR=$OPTARG ;;
         h) usage; exit 0 ;;
         \?) printf 'Unknown option: -%s\n\n' "$OPTARG" >&2; usage; exit 1 ;;
         :) printf 'Option -%s requires an argument\n\n' "$OPTARG" >&2; usage; exit 1 ;;
@@ -596,8 +609,12 @@ ORDER BY p.pdb_name, c.tablespace_name;
 SQLEOF
 
     cat > "$ASM_SQL" <<'SQLEOF'
--- ASM diskgroup space report. Run against the ASM instance ("/ as sysasm"),
--- not the RDBMS instance - v$asm_diskgroup is only populated there.
+-- ASM diskgroup space report, run through the ordinary database connection
+-- (no "/ as sysasm" needed). The database instance's ASMB background
+-- process mirrors V$ASM_DISKGROUP metadata for whichever diskgroups this
+-- database actually uses, so this view is populated here too - it just
+-- only covers this database's diskgroups, not every diskgroup the
+-- ASM/grid instance might manage for other databases on the host.
 -- usable_file_mb already accounts for NORMAL/HIGH redundancy mirroring and
 -- is generally the more meaningful "real" free-space figure than free_mb.
 SELECT
@@ -622,89 +639,138 @@ SQLEOF
 }
 
 # ===========================================================================
-# ASM diskgroup helpers
+# ASM diskgroup helper
 # ===========================================================================
-
-# Looks for a running ASM instance first (ps -ef | asm_pmon_<SID>), falling
-# back to an oratab entry whose SID starts with '+ASM'. Works the same way
-# on Solaris and Linux since ps -ef output is equivalent on both.
-detect_asm_sid() {
-    # Exclude any candidate line whose command contains 'awk' first - that
-    # can only be this very lookup (or another awk-based pipeline) matching
-    # itself in the process table, never a real asm_pmon_<SID> background
-    # process. Anchoring the field match to '^asm_pmon_' (a whole token,
-    # not just a substring) is the main fix: it stops an unrelated field
-    # like a literal '/asm_pmon_/' regex-with-delimiters (which can appear
-    # in our own command line) from being mistaken for a real SID.
-    _sid=$(ps -ef 2>/dev/null | awk '
-        $0 !~ /awk/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^asm_pmon_/) {
-                    n = $i
-                    sub(/^asm_pmon_/, "", n)
-                    print n
-                    exit
-                }
-            }
-        }')
-    if [ -n "${_sid:-}" ]; then printf '%s\n' "$_sid"; return 0; fi
-
-    _ot=$(find_oratab) || return 1
-    _sid=$(awk -F: '$1 ~ /^\+ASM/ && $0 !~ /^#/ {print $1; exit}' "$_ot")
-    if [ -n "${_sid:-}" ]; then printf '%s\n' "$_sid"; return 0; fi
-    return 1
-}
-
-# Runs the ASM diskgroup query in a subshell so the temporary ORACLE_SID /
-# ORACLE_HOME / *PATH switch never leaks into the rest of this script.
+# Queried directly through the same database connection as everything
+# else - no separate "/ as sysasm" connection to the ASM/grid instance.
+# The database's ASMB background process mirrors V$ASM_DISKGROUP metadata
+# for the diskgroups it uses, so this works with the ordinary CONNECT_STR
+# (e.g. plain "/ as sysdba") and needs no grid-home access at all. The
+# trade-off: this only shows diskgroups this database actually uses, not
+# every diskgroup the ASM/grid instance might be managing for other
+# databases on the same host.
 run_asm_query() {
     _outcsv=$1
-    _asm_sid="${ASM_SID_OPT:-$(detect_asm_sid)}"
-    if [ -z "${_asm_sid:-}" ]; then
-        warn "No ASM instance found (no asm_pmon_* process and no +ASM* oratab entry). Skipping ASM diskgroup section. Use -a <ASM_SID> to override detection, or -x to silence this."
-        return 1
-    fi
-    _asm_home=$(home_for_sid "$_asm_sid")
-    if [ -z "${_asm_home:-}" ]; then
-        warn "Found ASM SID '$_asm_sid' but could not resolve its ORACLE_HOME from oratab. Skipping ASM diskgroup section."
-        return 1
-    fi
-    info "ASM instance detected: $_asm_sid ($_asm_home)"
-
-    (
-        ORACLE_SID="$_asm_sid"; export ORACLE_SID
-        ORACLE_HOME="$_asm_home"; export ORACLE_HOME
-        PATH="$ORACLE_HOME/bin:$PATH"; export PATH
-        LD_LIBRARY_PATH="$ORACLE_HOME/lib:${LD_LIBRARY_PATH:-}"; export LD_LIBRARY_PATH
-        if [ "$OS_TYPE" = "SunOS" ]; then
-            LD_LIBRARY_PATH_64="$ORACLE_HOME/lib:${LD_LIBRARY_PATH_64:-}"; export LD_LIBRARY_PATH_64
-        fi
-        "$ORACLE_HOME/bin/sqlplus" -s "$ASM_CONNECT_STR" <<SQLEOF
-SET MARKUP CSV ON QUOTE ON DELIMITER ','
-SET FEEDBACK OFF
-SET ECHO OFF
-SET VERIFY OFF
-SET DEFINE OFF
-SET TRIMSPOOL ON
-SET PAGESIZE 50000
-SET LINESIZE 32767
-WHENEVER SQLERROR EXIT SQL.SQLCODE
-WHENEVER OSERROR EXIT 9
-@${ASM_SQL}
-EXIT SQL.SQLCODE
-SQLEOF
-    ) >"$_outcsv" 2>"${_outcsv}.err"
-    _rc=$?
-    if [ $_rc -ne 0 ]; then
-        warn "ASM diskgroup query failed (sqlplus exit code $_rc). Skipping ASM diskgroup section."
-        [ -s "${_outcsv}.err" ] && sed 's/^/    /' "${_outcsv}.err" >&2
-        [ -s "$_outcsv" ] && sed 's/^/    /' "$_outcsv" >&2
+    if ! run_sql_to_csv "$CONNECT_STR" "$ASM_SQL" "$_outcsv" "ASM diskgroup"; then
+        warn "ASM diskgroup query failed or returned nothing. Skipping ASM diskgroup section. Use -x to silence this warning."
         return 1
     fi
     if [ ! -s "$_outcsv" ]; then
-        warn "ASM diskgroup query returned no rows."
+        warn "ASM diskgroup query returned no rows. Skipping ASM diskgroup section."
         return 1
     fi
+    return 0
+}
+
+# ===========================================================================
+# Optional email sending (only used if -r RECIPIENTS was given)
+# ===========================================================================
+
+# base64 with a fallback chain: base64 -> openssl base64 -> uuencode.
+# Solaris boxes without GNU coreutils may lack a standalone 'base64'.
+b64encode() {
+    _in=$1
+    if command -v base64 >/dev/null 2>&1; then
+        base64 "$_in" 2>/dev/null && return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        openssl base64 -in "$_in" 2>/dev/null && return 0
+    fi
+    if command -v uuencode >/dev/null 2>&1; then
+        uuencode -m "$_in" attachment 2>/dev/null | sed '1d;$d' && return 0
+    fi
+    return 1
+}
+
+find_mailer() {
+    if [ -n "${MAILER_BIN:-}" ] && [ -x "${MAILER_BIN}" ]; then printf '%s\n' "$MAILER_BIN"; return 0; fi
+    for c in /usr/sbin/sendmail /usr/lib/sendmail /opt/csw/sbin/sendmail; do
+        [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    _c=$(command -v sendmail 2>/dev/null)
+    [ -n "$_c" ] && [ -x "$_c" ] && { printf '%s\n' "$_c"; return 0; }
+    return 1
+}
+
+# Builds a short plain-text body (no HTML dump) and a hand-rolled MIME
+# multipart message attaching the CSV(s)/HTML, then hands it to a
+# sendmail-compatible binary. Avoids depending on mutt/mailx attachment
+# flags, which vary a lot between Solaris and Linux and between versions.
+send_report_email() {
+    _from="$FROM_ADDR"
+    [ -z "$_from" ] && _from="$(id -un 2>/dev/null || echo oracle)@$(hostname 2>/dev/null || echo localhost)"
+
+    _tag_subj=""
+    [ -n "$TAG" ] && _tag_subj=" [$TAG]"
+    _subject="Oracle Tablespace Capacity Report - ${DB_NAME}${_tag_subj} - $(date '+%Y-%m-%d')"
+
+    _asm_line=""
+    if [ "$ASM_OK" -eq 0 ]; then
+        _asm_line="ASM diskgroups: $ASM_TOTAL total - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
+    fi
+
+    _body="${WORKDIR}/email_body.txt"
+    {
+        printf 'Oracle Tablespace Capacity Report for %s\n\n' "$DB_NAME"
+        printf 'Host:        %s\n' "$(hostname 2>/dev/null || echo unknown)"
+        printf 'Generated:   %s\n' "$RUN_TS_DISPLAY"
+        printf 'Mode:        %s\n' "$REPORT_MODE_LABEL"
+        printf 'Tablespaces: %s total - RED=%s AMBER=%s GREEN=%s\n' "$TS_TOTAL" "$TS_RED" "$TS_AMBER" "$TS_GREEN"
+        [ -n "$_asm_line" ] && printf '%s\n' "$_asm_line"
+        if [ -n "$TOP1" ]; then
+            printf '\nNeeds attention soonest (lowest estimated weeks until full):\n'
+            [ -n "$TOP1" ] && printf '  1. %s\n' "$TOP1"
+            [ -n "$TOP2" ] && printf '  2. %s\n' "$TOP2"
+            [ -n "$TOP3" ] && printf '  3. %s\n' "$TOP3"
+        fi
+        printf '\nFull detail is in the attached CSV/HTML files. Open the HTML report in a browser for sortable, filterable tables.\n'
+    } > "$_body"
+
+    _boundary="----=_TBSPRPT_$(date +%s)_$$"
+
+    _mime_attach() {
+        __path=$1; __ctype=$2; __name=$3
+        printf -- '--%s\r\n' "$_boundary"
+        printf 'Content-Type: %s; name="%s"\r\n' "$__ctype" "$__name"
+        printf 'Content-Disposition: attachment; filename="%s"\r\n' "$__name"
+        printf 'Content-Transfer-Encoding: base64\r\n\r\n'
+        b64encode "$__path" || { err "base64 encoding failed for $__path"; return 1; }
+        printf '\r\n'
+    }
+
+    _msg="${WORKDIR}/email_message.eml"
+    {
+        printf 'From: %s\r\n' "$_from"
+        printf 'To: %s\r\n' "$RECIPIENTS"
+        printf 'Subject: %s\r\n' "$_subject"
+        printf 'MIME-Version: 1.0\r\n'
+        printf 'Content-Type: multipart/mixed; boundary="%s"\r\n' "$_boundary"
+        printf '\r\n'
+        printf 'This is a multi-part message in MIME format.\r\n'
+        printf -- '--%s\r\n' "$_boundary"
+        printf 'Content-Type: text/plain; charset=us-ascii\r\n'
+        printf 'Content-Transfer-Encoding: 7bit\r\n\r\n'
+        cat "$_body"
+        printf '\r\n'
+        _mime_attach "$TBSP_CSV_OUT" "text/csv" "$(basename "$TBSP_CSV_OUT")"
+        [ -n "$ASM_CSV_OUT" ] && _mime_attach "$ASM_CSV_OUT" "text/csv" "$(basename "$ASM_CSV_OUT")"
+        _mime_attach "$HTML_OUT" "text/html" "$(basename "$HTML_OUT")"
+        printf -- '--%s--\r\n' "$_boundary"
+    } > "$_msg"
+
+    _mailer=$(find_mailer)
+    if [ -z "$_mailer" ]; then
+        err "No sendmail-compatible binary found (checked \$MAILER_BIN, /usr/sbin/sendmail, /usr/lib/sendmail, and PATH). Set MAILER_BIN=/path/to/sendmail to override. Report files were still written to $OUTDIR."
+        return 1
+    fi
+    info "Using mailer: $_mailer"
+    "$_mailer" -t -oi < "$_msg"
+    _rc=$?
+    if [ $_rc -ne 0 ]; then
+        err "Mail send failed (mailer exit code $_rc). Report files were still written to $OUTDIR."
+        return 1
+    fi
+    info "Email sent to: $RECIPIENTS"
     return 0
 }
 
@@ -750,10 +816,27 @@ AWKEOF
 cat > "${WORKDIR}/gen_tbsp_rows.awk" <<'AWKEOF'
 # Reads the tablespace CSV (header + rows) and emits <tr> HTML to stdout.
 # Aggregates written on END to: summaryfile (plain KEY=VALUE numbers, read
-# back by the calling shell) and cardsfile (ready-to-embed HTML for the
-# summary cards / callout, fully self-contained so no further escaping is
-# needed by the shell).
+# back by the calling shell - also used for the email body's "needs
+# attention soonest" list), and cardsfile/calloutfile (ready-to-embed HTML,
+# fully self-contained so no further escaping is needed by the shell).
 BEGIN { attn_weeks = 26 }
+
+# Insertion into a fixed 3-slot "lowest value seen" tracker. Called once
+# per row that has a sustainable_weeks value; avoids a second pass over
+# the CSV just to find the top-3 most urgent tablespaces.
+function offer_top3(val, label) {
+    if (!t1set || val < t1val) {
+        t3val = t2val; t3label = t2label; t3set = t2set
+        t2val = t1val; t2label = t1label; t2set = t1set
+        t1val = val; t1label = label; t1set = 1
+    } else if (!t2set || val < t2val) {
+        t3val = t2val; t3label = t2label; t3set = t2set
+        t2val = val; t2label = label; t2set = 1
+    } else if (!t3set || val < t3val) {
+        t3val = val; t3label = label; t3set = 1
+    }
+}
+
 NR == 1 {
     ncols = csv_split($0, hdr)
     for (i = 1; i <= ncols; i++) colidx[hdr[i]] = i
@@ -786,7 +869,7 @@ $0 == "" { next }
     has_sw = (sweeks_s != "")
     if (has_sw) {
         sw = sweeks_s + 0
-        if (!have_min || sw < min_sw) { have_min = 1; min_sw = sw; min_pdb = pdb; min_ts = tsn; min_color = color }
+        offer_top3(sw, pdb " / " tsn " (" color ")")
     }
 
     tclass = "stable"
@@ -817,6 +900,9 @@ END {
         print  "TS_RED="   (cnt["RED"] + 0)      > summaryfile
         print  "TS_AMBER=" (cnt["AMBER"] + 0)    > summaryfile
         print  "TS_GREEN=" (cnt["GREEN"] + 0)    > summaryfile
+        if (t1set) print "TOP1=" t1label " - " t1val " wks" > summaryfile
+        if (t2set) print "TOP2=" t2label " - " t2val " wks" > summaryfile
+        if (t3set) print "TOP3=" t3label " - " t3val " wks" > summaryfile
         close(summaryfile)
     }
     if (cardsfile != "") {
@@ -827,10 +913,10 @@ END {
         close(cardsfile)
     }
     if (calloutfile != "") {
-        if (have_min && min_sw < attn_weeks) {
-            printf "<div class=\"callout\">Closest to capacity: <b>%s / %s</b> (status %s) - approximately <b>%.1f weeks</b> of headroom left at its current average growth rate, including any addable datafile space.</div>\n", htmlesc(min_pdb), htmlesc(min_ts), min_color, min_sw > calloutfile
-        } else if (have_min) {
-            printf "<div class=\"callout\">All growing tablespaces have more than %d weeks of headroom at current growth rates. Closest is <b>%s / %s</b> at approximately <b>%.1f weeks</b>.</div>\n", attn_weeks, htmlesc(min_pdb), htmlesc(min_ts), min_sw > calloutfile
+        if (t1set && t1val < attn_weeks) {
+            printf "<div class=\"callout\">Closest to capacity: <b>%s</b> - approximately <b>%.1f weeks</b> of headroom left at its current average growth rate, including any addable datafile space.</div>\n", htmlesc(t1label), t1val > calloutfile
+        } else if (t1set) {
+            printf "<div class=\"callout\">All growing tablespaces have more than %d weeks of headroom at current growth rates. Closest is <b>%s</b> at approximately <b>%.1f weeks</b>.</div>\n", attn_weeks, htmlesc(t1label), t1val > calloutfile
         } else {
             printf "<div class=\"callout\">No tablespace currently shows positive sustained growth over the observed history, so a fill-by forecast cannot be computed for any of them.</div>\n" > calloutfile
         }
@@ -1208,6 +1294,7 @@ awk -v summaryfile="$TS_SUMMARY" -v cardsfile="$TS_CARDS" -v calloutfile="$TS_CA
     -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_tbsp_rows.awk" "$TBSP_CSV_RAW" > "$TS_ROWS"
 
 TS_TOTAL=0; TS_RED=0; TS_AMBER=0; TS_GREEN=0
+TOP1=""; TOP2=""; TOP3=""
 if [ -s "$TS_SUMMARY" ]; then
     while IFS='=' read -r _k _v; do
         case "$_k" in
@@ -1215,6 +1302,9 @@ if [ -s "$TS_SUMMARY" ]; then
             TS_RED)   TS_RED=$_v ;;
             TS_AMBER) TS_AMBER=$_v ;;
             TS_GREEN) TS_GREEN=$_v ;;
+            TOP1)     TOP1=$_v ;;
+            TOP2)     TOP2=$_v ;;
+            TOP3)     TOP3=$_v ;;
         esac
     done < "$TS_SUMMARY"
 fi
@@ -1268,7 +1358,7 @@ HTML_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}${TAG_SFX}.html"
         cat "$ASM_ROWS"
         cat "${WORKDIR}/template_asm_tail.html"
     else
-        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">ASM diskgroup data not available for this run (no ASM instance detected, or -x was used). See the run log for details.</p>\n'
+        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">ASM diskgroup data not available for this run (this database may not use ASM storage, the query failed, or -x was used). See the run log for details.</p>\n'
     fi
     cat "${WORKDIR}/template_d.html"
 } > "$HTML_OUT"
@@ -1278,9 +1368,17 @@ info "HTML report written: $HTML_OUT"
 info "Summary: $TS_TOTAL tablespace(s) evaluated - RED=$TS_RED AMBER=$TS_AMBER GREEN=$TS_GREEN"
 if [ "$ASM_OK" -eq 0 ]; then
     info "ASM: $ASM_TOTAL diskgroup(s) evaluated - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
-    EXIT_CODE=0
 else
     [ "$SKIP_ASM" -eq 0 ] && EXIT_CODE=4
+fi
+
+MAIL_SENT=0
+if [ -n "$RECIPIENTS" ]; then
+    if send_report_email; then
+        MAIL_SENT=1
+    else
+        EXIT_CODE=5
+    fi
 fi
 
 RUNLOG_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}${TAG_SFX}.log"
@@ -1289,5 +1387,6 @@ cp "$LOGFILE" "$RUNLOG_OUT" 2>/dev/null
 printf '\nDone. Files written to %s:\n  %s\n' "$OUTDIR" "$TBSP_CSV_OUT"
 [ -n "$ASM_CSV_OUT" ] && printf '  %s\n' "$ASM_CSV_OUT"
 printf '  %s\n  %s\n' "$HTML_OUT" "$RUNLOG_OUT"
+[ "$MAIL_SENT" -eq 1 ] && printf '\nEmailed to: %s\n' "$RECIPIENTS"
 
 exit $EXIT_CODE
