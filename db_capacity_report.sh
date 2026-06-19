@@ -66,6 +66,11 @@ SKIP_ASM=0
 RECIPIENTS=""
 FROM_ADDR=""
 
+# Paths to SQL files written by write_sql_templates() into WORKDIR
+NONCDB_SQL=""
+CDB_SQL=""
+ASM_SQL=""
+
 # Business rules carried over verbatim from the source query. Adjust here if
 # your standards differ (e.g. a different max-datafiles-per-tablespace policy).
 DF_RED_THRESHOLD=900     # datafile_count > this  -> RED
@@ -700,31 +705,39 @@ send_report_email() {
     _from="$FROM_ADDR"
     [ -z "$_from" ] && _from="$(id -un 2>/dev/null || echo oracle)@$(hostname 2>/dev/null || echo localhost)"
 
-    _tag_subj=""
-    [ -n "$TAG" ] && _tag_subj=" [$TAG]"
-    _subject="Oracle Tablespace Capacity Report - ${DB_NAME}${_tag_subj} - $(date '+%Y-%m-%d')"
+    _report_tag="${TAG:-${DB_LABEL}}"
+    _subject="Oracle Tablespace Capacity Report [${_report_tag}] $(date '+%Y-%m-%d')"
 
     _asm_line=""
-    if [ "$ASM_OK" -eq 0 ]; then
-        _asm_line="ASM diskgroups: $ASM_TOTAL total - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
-    fi
+    [ "$ASM_OK" -eq 0 ] && _asm_line="ASM diskgroups: $ASM_TOTAL total - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
 
     _body="${WORKDIR}/email_body.txt"
     {
-        printf 'Oracle Tablespace Capacity Report for %s\n\n' "$DB_NAME"
+        printf 'Oracle Tablespace Capacity Report - Tag: %s\n\n' "$_report_tag"
         printf 'Host:        %s\n' "$(hostname 2>/dev/null || echo unknown)"
         printf 'Generated:   %s\n' "$RUN_TS_DISPLAY"
-        printf 'Mode:        %s\n' "$REPORT_MODE_LABEL"
+        printf 'Databases:   %s\n' "$DB_COUNT"
         printf 'Tablespaces: %s total - RED=%s AMBER=%s GREEN=%s\n' "$TS_TOTAL" "$TS_RED" "$TS_AMBER" "$TS_GREEN"
         [ -n "$_asm_line" ] && printf '%s\n' "$_asm_line"
         if [ -n "$TOP1" ]; then
             printf '\nNeeds attention soonest (lowest estimated weeks until full):\n'
-            [ -n "$TOP1" ] && printf '  1. %s\n' "$TOP1"
+            printf '  1. %s\n' "$TOP1"
             [ -n "$TOP2" ] && printf '  2. %s\n' "$TOP2"
             [ -n "$TOP3" ] && printf '  3. %s\n' "$TOP3"
         fi
-        printf '\nFull detail is in the attached CSV/HTML files. Open the HTML report in a browser for sortable, filterable tables.\n'
+        printf '\nAttachments: today'"'"'s data CSV (date=%s) and the full HTML report.\nOpen the HTML file in a browser for per-database tabs, sortable/filterable tables.\n' "$TODAY"
     } > "$_body"
+
+    # Extract just today's rows for the CSV attachment (not the whole master)
+    _today_tbsp_csv="${WORKDIR}/today_tbsp.csv"
+    extract_today_csv "$MASTER_TBSP_CSV" "$_today_tbsp_csv" "$TODAY"
+    _today_tbsp_name="${_report_tag}_tbsp_capacity_${TODAY}.csv"
+
+    _today_asm_csv=""
+    if [ "$ASM_OK" -eq 0 ] && [ -f "$MASTER_ASM_CSV" ]; then
+        _today_asm_csv="${WORKDIR}/today_asm.csv"
+        extract_today_csv "$MASTER_ASM_CSV" "$_today_asm_csv" "$TODAY"
+    fi
 
     _boundary="----=_TBSPRPT_$(date +%s)_$$"
 
@@ -752,22 +765,22 @@ send_report_email() {
         printf 'Content-Transfer-Encoding: 7bit\r\n\r\n'
         cat "$_body"
         printf '\r\n'
-        _mime_attach "$TBSP_CSV_OUT" "text/csv" "$(basename "$TBSP_CSV_OUT")"
-        [ -n "$ASM_CSV_OUT" ] && _mime_attach "$ASM_CSV_OUT" "text/csv" "$(basename "$ASM_CSV_OUT")"
+        _mime_attach "$_today_tbsp_csv" "text/csv" "$_today_tbsp_name"
+        [ -n "$_today_asm_csv" ] && _mime_attach "$_today_asm_csv" "text/csv" "${_report_tag}_asm_diskgroup_${TODAY}.csv"
         _mime_attach "$HTML_OUT" "text/html" "$(basename "$HTML_OUT")"
         printf -- '--%s--\r\n' "$_boundary"
     } > "$_msg"
 
     _mailer=$(find_mailer)
     if [ -z "$_mailer" ]; then
-        err "No sendmail-compatible binary found (checked \$MAILER_BIN, /usr/sbin/sendmail, /usr/lib/sendmail, and PATH). Set MAILER_BIN=/path/to/sendmail to override. Report files were still written to $OUTDIR."
+        err "No sendmail-compatible binary found (checked \$MAILER_BIN, /usr/sbin/sendmail, /usr/lib/sendmail, PATH). Set MAILER_BIN=/path/to/sendmail to override. Report files still written to $OUTDIR."
         return 1
     fi
-    info "Using mailer: $_mailer"
+    info "Emailing to $RECIPIENTS via $_mailer (tag=$_report_tag, date=$TODAY)"
     "$_mailer" -t -oi < "$_msg"
     _rc=$?
     if [ $_rc -ne 0 ]; then
-        err "Mail send failed (mailer exit code $_rc). Report files were still written to $OUTDIR."
+        err "Mail send failed (mailer exit code $_rc). Report files still written to $OUTDIR."
         return 1
     fi
     info "Email sent to: $RECIPIENTS"
@@ -775,207 +788,360 @@ send_report_email() {
 }
 
 # ===========================================================================
-# Report-building assets (awk libraries + HTML template fragments)
+
+# ===========================================================================
+# CSV management: add run_date column + consolidated master CSV per -N tag
+# ===========================================================================
+
+# Prepends a "run_date" column (YYYY-MM-DD) to every row of a CSV file.
+# For the ASM CSV we also inject db_name since the SQL doesn't include it.
+add_date_column() {
+    _raw=$1; _dated=$2; _today=$3; _dbname=${4:-}
+    awk -v today="$_today" -v db="$_dbname" '
+    NR==1 {
+        if (db != "") print "\"run_date\",\"db_name\"," $0
+        else           print "\"run_date\"," $0
+        next
+    }
+    {
+        if (db != "") print "\"" today "\",\"" db "\"," $0
+        else          print "\"" today "\"," $0
+    }' "$_raw" > "$_dated"
+}
+
+# Merges the dated CSV into the master CSV at OUTDIR/<TAG>_<suffix>.csv.
+# Logic: remove all existing rows for (today, this DB), then append new rows.
+# On first run the master CSV is created. Header is always kept.
+update_master_csv() {
+    _master=$1; _dated=$2; _today=$3; _dbname=$4
+
+    if [ ! -f "$_master" ]; then
+        cp "$_dated" "$_master"
+        info "Created master CSV: $_master"
+        return 0
+    fi
+
+    _tmp="${_master}.tmp.$$"
+    # Keep header + all rows NOT matching (today, this db)
+    awk -v today="$_today" -v db="$_dbname" '
+    BEGIN { hdr=1 }
+    hdr { print; hdr=0; next }
+    {
+        # Check first two quoted fields: run_date and db_name
+        line=$0
+        # strip leading quote, grab first field
+        f1=line; sub(/^"/, "", f1); sub(/".*/, "", f1)
+        rest=line; sub(/^"[^"]*","/, "", rest); f2=rest; sub(/".*/, "", f2)
+        if (f1 == today && f2 == db) next
+        print
+    }' "$_master" > "$_tmp"
+    # Append new rows (skip header of dated CSV)
+    tail -n +2 "$_dated" >> "$_tmp"
+    mv "$_tmp" "$_master"
+    info "Updated master CSV: $_master"
+}
+
+# Extracts just today's rows from the master CSV (for email attachment).
+extract_today_csv() {
+    _master=$1; _out=$2; _today=$3
+    awk -v today="$_today" '
+    NR==1 { print; next }
+    {
+        f1=$0; sub(/^"/, "", f1); sub(/".*/, "", f1)
+        if (f1 == today) print
+    }' "$_master" > "$_out"
+}
+
+
+# ===========================================================================
+# Report assets: awk libraries written to WORKDIR at runtime
 # ===========================================================================
 write_report_assets() {
 
+# ---- Shared CSV parser (mawk/nawk/gawk portable) ----
 cat > "${WORKDIR}/csvlib.awk" <<'AWKEOF'
-# Shared helpers for the row-generator awk scripts.
-
-# RFC4180-style CSV split (handles "quoted, fields" and doubled "" quotes).
-# Deliberately written with only basic string ops (substr/length) so it runs
-# under any awk - mawk, nawk, busybox awk, gawk - not just gawk's FPAT.
 function csv_split(line, arr,    i, c, field, inquote, n) {
-    n = 0; field = ""; inquote = 0
-    for (i = 1; i <= length(line); i++) {
-        c = substr(line, i, 1)
+    n=0; field=""; inquote=0
+    for (i=1; i<=length(line); i++) {
+        c=substr(line,i,1)
         if (inquote) {
-            if (c == "\"") {
-                if (substr(line, i + 1, 1) == "\"") { field = field "\""; i++ }
-                else { inquote = 0 }
-            } else field = field c
+            if (c=="\"") {
+                if (substr(line,i+1,1)=="\"") { field=field "\""; i++ }
+                else inquote=0
+            } else field=field c
         } else {
-            if (c == "\"") inquote = 1
-            else if (c == ",") { arr[++n] = field; field = "" }
-            else field = field c
+            if (c=="\"") inquote=1
+            else if (c==",") { arr[++n]=field; field="" }
+            else field=field c
         }
     }
-    arr[++n] = field
-    return n
+    arr[++n]=field; return n
 }
-
 function htmlesc(s) {
-    gsub(/&/, "\\&amp;", s)
-    gsub(/</, "\\&lt;", s)
-    gsub(/>/, "\\&gt;", s)
-    gsub(/"/, "\\&quot;", s)
+    gsub(/&/,"\\&amp;",s); gsub(/</,"\\&lt;",s)
+    gsub(/>/,"\\&gt;",s);  gsub(/"/,"\\&quot;",s)
     return s
 }
+function sanitize(s) { gsub(/[^A-Za-z0-9]/,"_",s); return s }
 AWKEOF
 
-cat > "${WORKDIR}/gen_tbsp_rows.awk" <<'AWKEOF'
-# Reads the tablespace CSV (header + rows) and emits <tr> HTML to stdout.
-# Aggregates written on END to: summaryfile (plain KEY=VALUE numbers, read
-# back by the calling shell - also used for the email body's "needs
-# attention soonest" list), and cardsfile/calloutfile (ready-to-embed HTML,
-# fully self-contained so no further escaping is needed by the shell).
-BEGIN { attn_weeks = 26 }
+# ---- Tablespace tab generator ----
+# Reads the master tablespace CSV (run_date,db_name,pdb_name,...).
+# For each db_name shows only its most-recent run_date rows.
+# Outputs:
+#   stdout        -> tab panels HTML  (one <div class=tab-panel> per db)
+#   tabsfile      -> tab button HTML
+#   cardsfile     -> global summary cards HTML
+#   calloutfile   -> closest-to-capacity callout HTML
+#   summaryfile   -> KEY=VALUE stats (read back by shell for email body)
+cat > "${WORKDIR}/gen_tabs.awk" <<'AWKEOF'
+BEGIN { attn_weeks=26 }
 
-# Insertion into a fixed 3-slot "lowest value seen" tracker. Called once
-# per row that has a sustainable_weeks value; avoids a second pass over
-# the CSV just to find the top-3 most urgent tablespaces.
-function offer_top3(val, label) {
-    if (!t1set || val < t1val) {
-        t3val = t2val; t3label = t2label; t3set = t2set
-        t2val = t1val; t2label = t1label; t2set = t1set
-        t1val = val; t1label = label; t1set = 1
-    } else if (!t2set || val < t2val) {
-        t3val = t2val; t3label = t2label; t3set = t2set
-        t2val = val; t2label = label; t2set = 1
-    } else if (!t3set || val < t3val) {
-        t3val = val; t3label = label; t3set = 1
+function offer_top3(sw, label) {
+    if (!t1set || sw<t1sw) {
+        t3sw=t2sw;t3label=t2label;t3set=t2set
+        t2sw=t1sw;t2label=t1label;t2set=t1set
+        t1sw=sw;  t1label=label;  t1set=1
+    } else if (!t2set || sw<t2sw) {
+        t3sw=t2sw;t3label=t2label;t3set=t2set
+        t2sw=sw;  t2label=label;  t2set=1
+    } else if (!t3set || sw<t3sw) {
+        t3sw=sw; t3label=label; t3set=1
     }
 }
 
-NR == 1 {
-    ncols = csv_split($0, hdr)
-    for (i = 1; i <= ncols; i++) colidx[hdr[i]] = i
+NR==1 {
+    ncols=csv_split($0,hdr)
+    # NOTE: sqlplus outputs column names in UPPERCASE; tolower() normalises them.
+    for (i=1;i<=ncols;i++) colidx[tolower(hdr[i])]=i
     next
 }
-$0 == "" { next }
+$0=="" { next }
 {
-    n = csv_split($0, f)
-    pdb     = f[colidx["pdb_name"]]
-    tsn     = f[colidx["tablespace_name"]]
-    dfc     = f[colidx["datafile_count"]] + 0
-    alloc   = f[colidx["allocated_gb"]] + 0
-    used    = f[colidx["used_gb"]] + 0
-    free    = f[colidx["free_gb"]] + 0
-    addable = f[colidx["addable_gb"]] + 0
-    growth  = f[colidx["avg_weekly_growth_gb"]] + 0
-    trend   = f[colidx["growth_trend"]]
-    sweeks_s = f[colidx["sustainable_weeks"]]
-    swnote  = f[colidx["sustainable_weeks_note"]]
-    color   = f[colidx["color"]]
+    n=csv_split($0,f)
+    db=f[colidx["db_name"]]; rdate=f[colidx["run_date"]]
+    if (!seen_db[db]) { dbs[++ndb]=db; seen_db[db]=1 }
+    if (rdate > max_date[db]) max_date[db]=rdate
+    rows[++total]=$0; row_db[total]=db; row_date[total]=rdate
+}
 
-    pct = (alloc > 0) ? (used / alloc * 100) : 0
-    if (pct > 100) pct = 100
-    if (pct < 0) pct = 0
-
-    total++
-    cnt[color]++
-    sum_alloc += alloc; sum_used += used; sum_free += free
-
-    has_sw = (sweeks_s != "")
-    if (has_sw) {
-        sw = sweeks_s + 0
-        offer_top3(sw, pdb " / " tsn " (" color ")")
+END {
+    # Alphabetical sort of db names (insertion sort)
+    for (i=2;i<=ndb;i++) {
+        key=dbs[i]; j=i-1
+        while (j>=1 && dbs[j]>key) { dbs[j+1]=dbs[j]; j-- }
+        dbs[j+1]=key
     }
 
-    tclass = "stable"
-    if (trend == "INCREASING") tclass = "up"
-    else if (trend ~ /DECREASING/) tclass = "down"
+    # Global aggregates over each db's latest snapshot
+    for (r=1;r<=total;r++) {
+        db=row_db[r]
+        if (row_date[r]!=max_date[db]) continue
+        n=csv_split(rows[r],f)
+        color=f[colidx["color"]]
+        alloc=f[colidx["allocated_gb"]]+0
+        used =f[colidx["used_gb"]]+0
+        sw_s =f[colidx["sustainable_weeks"]]
+        pdb  =f[colidx["pdb_name"]]
+        tsn  =f[colidx["tablespace_name"]]
+        g_total++; g_color[color]++
+        g_alloc+=alloc; g_used+=used
+        db_total[db]++; db_color[db SUBSEP color]++
+        db_alloc[db]+=alloc; db_used[db]+=used
+        if (sw_s!="") offer_top3(sw_s+0, db " / " pdb " / " tsn " (" color ")")
+    }
 
-    printf "<tr class=\"r-%s\" data-pdb=\"%s\" data-ts=\"%s\">\n", tolower(color), htmlesc(pdb), htmlesc(tsn)
-    printf "<td>%s</td>\n", htmlesc(pdb)
-    printf "<td class=\"mono\">%s</td>\n", htmlesc(tsn)
-    printf "<td class=\"num\">%d</td>\n", dfc
-    printf "<td class=\"num\">%.2f</td>\n", alloc
-    printf "<td class=\"num\">%.2f</td>\n", used
-    printf "<td class=\"num\">%.2f</td>\n", free
-    printf "<td class=\"num\">%.2f</td>\n", addable
-    printf "<td class=\"barcell\"><div class=\"bar\"><div class=\"barfill bf-%s\" style=\"width:%.1f%%\"></div></div><span class=\"barlabel\">%.1f%%</span></td>\n", tolower(color), pct, pct
-    printf "<td class=\"num\">%.2f</td>\n", growth
-    printf "<td><span class=\"pill p-%s\">%s</span></td>\n", tclass, htmlesc(trend)
-    if (has_sw)
-        printf "<td class=\"num tip\" data-tip=\"%s\">%.1f</td>\n", htmlesc(swnote), sw
-    else
-        printf "<td class=\"num tip\" data-tip=\"%s\">-</td>\n", htmlesc(swnote)
-    printf "<td><span class=\"badge b-%s\">%s</span></td>\n", tolower(color), color
-    print "</tr>"
-}
-END {
-    if (summaryfile != "") {
-        print  "TS_TOTAL=" (total + 0)          > summaryfile
-        print  "TS_RED="   (cnt["RED"] + 0)      > summaryfile
-        print  "TS_AMBER=" (cnt["AMBER"] + 0)    > summaryfile
-        print  "TS_GREEN=" (cnt["GREEN"] + 0)    > summaryfile
-        if (t1set) print "TOP1=" t1label " - " t1val " wks" > summaryfile
-        if (t2set) print "TOP2=" t2label " - " t2val " wks" > summaryfile
-        if (t3set) print "TOP3=" t3label " - " t3val " wks" > summaryfile
+    # Summary file (shell reads this back)
+    if (summaryfile!="") {
+        print "TS_TOTAL=" (g_total+0)           > summaryfile
+        print "TS_RED="   (g_color["RED"]+0)     > summaryfile
+        print "TS_AMBER=" (g_color["AMBER"]+0)   > summaryfile
+        print "TS_GREEN=" (g_color["GREEN"]+0)   > summaryfile
+        print "DB_COUNT=" ndb                    > summaryfile
+        if (t1set) print "TOP1=" t1label " - " t1sw " wks" > summaryfile
+        if (t2set) print "TOP2=" t2label " - " t2sw " wks" > summaryfile
+        if (t3set) print "TOP3=" t3label " - " t3sw " wks" > summaryfile
         close(summaryfile)
     }
-    if (cardsfile != "") {
-        printf "<div class=\"card red\"><div class=\"n\">%d</div><div class=\"l\">Tablespaces RED</div></div>\n", cnt["RED"] + 0 > cardsfile
-        printf "<div class=\"card amber\"><div class=\"n\">%d</div><div class=\"l\">Tablespaces AMBER</div></div>\n", cnt["AMBER"] + 0 > cardsfile
-        printf "<div class=\"card green\"><div class=\"n\">%d</div><div class=\"l\">Tablespaces GREEN</div></div>\n", cnt["GREEN"] + 0 > cardsfile
-        printf "<div class=\"card\"><div class=\"n\">%.0f / %.0f</div><div class=\"l\">Used / Allocated (GB), %d tablespaces</div></div>\n", sum_used, sum_alloc, total + 0 > cardsfile
+
+    # Cards
+    if (cardsfile!="") {
+        printf "<div class=\"card red\"><div class=\"n\">%d</div><div class=\"l\">RED (all DBs)</div></div>\n",   g_color["RED"]+0   > cardsfile
+        printf "<div class=\"card amber\"><div class=\"n\">%d</div><div class=\"l\">AMBER (all DBs)</div></div>\n", g_color["AMBER"]+0 > cardsfile
+        printf "<div class=\"card green\"><div class=\"n\">%d</div><div class=\"l\">GREEN (all DBs)</div></div>\n", g_color["GREEN"]+0 > cardsfile
+        printf "<div class=\"card\"><div class=\"n\">%.0f / %.0f GB</div><div class=\"l\">Used / Allocated &mdash; %d database(s)</div></div>\n", g_used, g_alloc, ndb > cardsfile
         close(cardsfile)
     }
-    if (calloutfile != "") {
-        if (t1set && t1val < attn_weeks) {
-            printf "<div class=\"callout\">Closest to capacity: <b>%s</b> - approximately <b>%.1f weeks</b> of headroom left at its current average growth rate, including any addable datafile space.</div>\n", htmlesc(t1label), t1val > calloutfile
-        } else if (t1set) {
-            printf "<div class=\"callout\">All growing tablespaces have more than %d weeks of headroom at current growth rates. Closest is <b>%s</b> at approximately <b>%.1f weeks</b>.</div>\n", attn_weeks, htmlesc(t1label), t1val > calloutfile
-        } else {
-            printf "<div class=\"callout\">No tablespace currently shows positive sustained growth over the observed history, so a fill-by forecast cannot be computed for any of them.</div>\n" > calloutfile
-        }
+
+    # Callout
+    if (calloutfile!="") {
+        if (t1set && t1sw<attn_weeks)
+            printf "<div class=\"callout callout-warn\">&#9888; Closest to capacity: <b>%s</b> &mdash; approx. <b>%.1f weeks</b> of headroom (including addable files) at current growth rate.</div>\n", htmlesc(t1label), t1sw > calloutfile
+        else if (t1set)
+            printf "<div class=\"callout\">All growing tablespaces have more than %d weeks of headroom. Closest: <b>%s</b> at <b>%.1f weeks</b>.</div>\n", attn_weeks, htmlesc(t1label), t1sw > calloutfile
+        else
+            printf "<div class=\"callout\">No tablespace shows positive sustained growth &mdash; fill-by forecast not applicable.</div>\n" > calloutfile
         close(calloutfile)
     }
+
+    # Tab buttons
+    if (tabsfile!="") {
+        for (d=1;d<=ndb;d++) {
+            db=dbs[d]; cls=(d==1)?"tab-btn active":"tab-btn"
+            red=db_color[db SUBSEP "RED"]+0; amber=db_color[db SUBSEP "AMBER"]+0
+            badge=""
+            if      (red>0)   badge=" <span class=\"tbadge b-red\">"   red   "</span>"
+            else if (amber>0) badge=" <span class=\"tbadge b-amber\">" amber "</span>"
+            printf "<button class=\"%s\" data-tab=\"%s\">%s%s</button>\n", cls, sanitize(db), htmlesc(db), badge > tabsfile
+        }
+        close(tabsfile)
+    }
+
+    # Tab panels (stdout)
+    for (d=1;d<=ndb;d++) {
+        db=dbs[d]; tid=sanitize(db); cls=(d==1)?"tab-panel active":"tab-panel"
+        red=db_color[db SUBSEP "RED"]+0; amber=db_color[db SUBSEP "AMBER"]+0; green=db_color[db SUBSEP "GREEN"]+0
+        printf "<div class=\"%s\" id=\"%s\">\n", cls, tid
+        printf "<div class=\"db-meta\">%d tablespaces &nbsp;|&nbsp; RED: %d &nbsp; AMBER: %d &nbsp; GREEN: %d &nbsp;|&nbsp; Used: %.0f / %.0f GB &nbsp;|&nbsp; Data as of: <b>%s</b></div>\n", db_total[db], red, amber, green, db_used[db], db_alloc[db], max_date[db]
+        printf "<input class=\"search\" type=\"text\" placeholder=\"Filter tablespace or PDB...\" data-filter-target=\"#tbody-%s\">\n", tid
+        printf "<div class=\"tablewrap\"><table data-sortable><thead><tr>\n"
+        printf "<th class=\"tip\" data-tip=\"Pluggable DB (N/A for non-CDB)\">PDB</th>\n"
+        printf "<th class=\"tip\" data-tip=\"Tablespace name\">Tablespace</th>\n"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Datafile count. RED &gt;900, AMBER &gt;800.\">Datafiles</th>\n"
+        printf "<th data-type=\"num\">Allocated (GB)</th>\n"
+        printf "<th data-type=\"num\">Used (GB)</th>\n"
+        printf "<th data-type=\"num\">Free (GB)</th>\n"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Extra space available by adding more datafiles (up to 1023 files x 32GB at 8K block size).\">Addable (GB)</th>\n"
+        printf "<th data-type=\"num\">Used %%</th>\n"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Average weekly growth over trailing 26 weeks of AWR history.\">Avg Wkly Growth (GB)</th>\n"
+        printf "<th>Trend</th>\n"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Estimated weeks until full at current growth rate, including addable space. Hover for note.\">Sustainable (wks)</th>\n"
+        printf "<th>Status</th>\n"
+        printf "</tr></thead><tbody id=\"tbody-%s\">\n", tid
+
+        for (r=1;r<=total;r++) {
+            if (row_db[r]!=db || row_date[r]!=max_date[db]) continue
+            n=csv_split(rows[r],f)
+            pdb    =f[colidx["pdb_name"]]
+            tsn    =f[colidx["tablespace_name"]]
+            dfc    =f[colidx["datafile_count"]]+0
+            alloc  =f[colidx["allocated_gb"]]+0
+            used   =f[colidx["used_gb"]]+0
+            free   =f[colidx["free_gb"]]+0
+            addable=f[colidx["addable_gb"]]+0
+            growth =f[colidx["avg_weekly_growth_gb"]]+0
+            trend  =f[colidx["growth_trend"]]
+            sw_s   =f[colidx["sustainable_weeks"]]
+            swnote =f[colidx["sustainable_weeks_note"]]
+            color  =f[colidx["color"]]
+            pct=(alloc>0)?(used/alloc*100):0
+            if (pct>100) pct=100; if (pct<0) pct=0
+            tclass="stable"
+            if (trend=="INCREASING") tclass="up"
+            else if (trend~/DECREASING/) tclass="down"
+            printf "<tr class=\"r-%s\" data-pdb=\"%s\" data-ts=\"%s\">\n", tolower(color), htmlesc(pdb), htmlesc(tsn)
+            printf "<td>%s</td><td class=\"mono\">%s</td>\n", htmlesc(pdb), htmlesc(tsn)
+            printf "<td class=\"num\">%d</td>\n", dfc
+            printf "<td class=\"num\">%.2f</td><td class=\"num\">%.2f</td><td class=\"num\">%.2f</td><td class=\"num\">%.2f</td>\n", alloc, used, free, addable
+            printf "<td class=\"barcell\"><div class=\"bar\"><div class=\"barfill bf-%s\" style=\"width:%.1f%%\"></div></div><span class=\"barlabel\">%.1f%%</span></td>\n", tolower(color), pct, pct
+            printf "<td class=\"num\">%.2f</td>\n", growth
+            printf "<td><span class=\"pill p-%s\">%s</span></td>\n", tclass, htmlesc(trend)
+            if (sw_s!="") printf "<td class=\"num tip\" data-tip=\"%s\">%.1f</td>\n", htmlesc(swnote), sw_s+0
+            else          printf "<td class=\"num tip\" data-tip=\"%s\">-</td>\n",    htmlesc(swnote)
+            printf "<td><span class=\"badge b-%s\">%s</span></td>\n", tolower(color), color
+            print  "</tr>"
+        }
+        printf "</tbody></table></div></div>\n"
+    }
 }
 AWKEOF
 
-cat > "${WORKDIR}/gen_asm_rows.awk" <<'AWKEOF'
-# Reads the ASM diskgroup CSV (header + rows) and emits <tr> HTML to stdout,
-# plus summary/cards files on END (same convention as gen_tbsp_rows.awk).
-NR == 1 {
-    ncols = csv_split($0, hdr)
-    for (i = 1; i <= ncols; i++) colidx[hdr[i]] = i
+# ---- ASM tab generator ----
+# Reads master ASM CSV (run_date, db_name, diskgroup_name, ...).
+cat > "${WORKDIR}/gen_asm_tabs.awk" <<'AWKEOF'
+NR==1 {
+    ncols=csv_split($0,hdr)
+    for (i=1;i<=ncols;i++) colidx[tolower(hdr[i])]=i
     next
 }
-$0 == "" { next }
+$0=="" { next }
 {
-    n = csv_split($0, f)
-    dg      = f[colidx["diskgroup_name"]]
-    state   = f[colidx["state"]]
-    rtype   = f[colidx["redundancy_type"]]
-    totgb   = f[colidx["total_gb"]] + 0
-    freegb  = f[colidx["free_gb"]] + 0
-    pctused = f[colidx["pct_used"]] + 0
-    usable  = f[colidx["usable_free_gb"]] + 0
-    reqmir  = f[colidx["required_mirror_free_gb"]] + 0
-    offdsk  = f[colidx["offline_disks"]] + 0
-    color   = f[colidx["color"]]
-
-    total++
-    cnt[color]++
-    sum_total += totgb; sum_usable += usable
-
-    printf "<tr class=\"r-%s\">\n", tolower(color)
-    printf "<td class=\"mono\">%s</td>\n", htmlesc(dg)
-    printf "<td>%s</td>\n", htmlesc(state)
-    printf "<td>%s</td>\n", htmlesc(rtype)
-    printf "<td class=\"num\">%.2f</td>\n", totgb
-    printf "<td class=\"num\">%.2f</td>\n", freegb
-    printf "<td class=\"num\">%.1f%%</td>\n", pctused
-    printf "<td class=\"num\">%.2f</td>\n", usable
-    printf "<td class=\"num\">%.2f</td>\n", reqmir
-    printf "<td class=\"num\">%d</td>\n", offdsk
-    printf "<td><span class=\"badge b-%s\">%s</span></td>\n", tolower(color), color
-    print "</tr>"
+    n=csv_split($0,f)
+    db=f[colidx["db_name"]]; rdate=f[colidx["run_date"]]
+    if (!seen_db[db]) { dbs[++ndb]=db; seen_db[db]=1 }
+    if (rdate > max_date[db]) max_date[db]=rdate
+    rows[++total]=$0; row_db[total]=db; row_date[total]=rdate
 }
 END {
-    if (summaryfile != "") {
-        print "ASM_TOTAL=" (total + 0)       > summaryfile
-        print "ASM_RED="   (cnt["RED"] + 0)   > summaryfile
-        print "ASM_AMBER=" (cnt["AMBER"] + 0) > summaryfile
-        print "ASM_GREEN=" (cnt["GREEN"] + 0) > summaryfile
+    for (i=2;i<=ndb;i++) {
+        key=dbs[i]; j=i-1
+        while (j>=1 && dbs[j]>key) { dbs[j+1]=dbs[j]; j-- }
+        dbs[j+1]=key
+    }
+    for (r=1;r<=total;r++) {
+        db=row_db[r]
+        if (row_date[r]!=max_date[db]) continue
+        n=csv_split(rows[r],f)
+        color=f[colidx["color"]]
+        g_total++; g_color[color]++
+        db_color[db SUBSEP color]++
+    }
+    if (summaryfile!="") {
+        print "ASM_TOTAL=" (g_total+0)         > summaryfile
+        print "ASM_RED="   (g_color["RED"]+0)   > summaryfile
+        print "ASM_AMBER=" (g_color["AMBER"]+0) > summaryfile
+        print "ASM_GREEN=" (g_color["GREEN"]+0) > summaryfile
         close(summaryfile)
     }
-    if (cardsfile != "") {
-        at_risk = (cnt["RED"] + 0) + (cnt["AMBER"] + 0)
-        printf "<div class=\"card%s\"><div class=\"n\">%d / %d</div><div class=\"l\">ASM diskgroups at risk (red+amber) / total</div></div>\n", (at_risk > 0 ? " red" : ""), at_risk, total + 0 > cardsfile
+    if (cardsfile!="") {
+        at_risk=(g_color["RED"]+0)+(g_color["AMBER"]+0)
+        cls=(at_risk>0)?" red":""
+        printf "<div class=\"card%s\"><div class=\"n\">%d / %d</div><div class=\"l\">ASM at-risk (red+amber) / total diskgroups</div></div>\n", cls, at_risk, g_total > cardsfile
         close(cardsfile)
+    }
+    if (tabsfile!="") {
+        for (d=1;d<=ndb;d++) {
+            db=dbs[d]; cls=(d==1)?"tab-btn active":"tab-btn"
+            red=db_color[db SUBSEP "RED"]+0; amber=db_color[db SUBSEP "AMBER"]+0
+            badge=""
+            if      (red>0)   badge=" <span class=\"tbadge b-red\">"   red   "</span>"
+            else if (amber>0) badge=" <span class=\"tbadge b-amber\">" amber "</span>"
+            printf "<button class=\"%s\" data-tab=\"asm-%s\">%s%s</button>\n", cls, sanitize(db), htmlesc(db), badge > tabsfile
+        }
+        close(tabsfile)
+    }
+    for (d=1;d<=ndb;d++) {
+        db=dbs[d]; tid="asm-" sanitize(db); cls=(d==1)?"tab-panel active":"tab-panel"
+        printf "<div class=\"%s\" id=\"%s\">\n", cls, tid
+        printf "<div class=\"db-meta\">Data as of: <b>%s</b></div>\n", max_date[db]
+        printf "<div class=\"tablewrap\"><table data-sortable><thead><tr>\n"
+        printf "<th>Diskgroup</th><th>State</th><th>Redundancy</th>"
+        printf "<th data-type=\"num\">Total (GB)</th><th data-type=\"num\">Free (GB)</th>"
+        printf "<th data-type=\"num\">Used %%</th>"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Usable space after mirroring overhead - the realistic free-space figure for NORMAL/HIGH redundancy.\">Usable Free (GB)</th>"
+        printf "<th data-type=\"num\" class=\"tip\" data-tip=\"Space ASM must keep free to restore redundancy after a disk failure.\">Req Mirror Free (GB)</th>"
+        printf "<th data-type=\"num\">Offline Disks</th><th>Status</th>\n"
+        printf "</tr></thead><tbody>\n"
+        for (r=1;r<=total;r++) {
+            if (row_db[r]!=db || row_date[r]!=max_date[db]) continue
+            n=csv_split(rows[r],f)
+            dg     =f[colidx["diskgroup_name"]]
+            state  =f[colidx["state"]]
+            rtype  =f[colidx["redundancy_type"]]
+            totgb  =f[colidx["total_gb"]]+0
+            freegb =f[colidx["free_gb"]]+0
+            pctused=f[colidx["pct_used"]]+0
+            usable =f[colidx["usable_free_gb"]]+0
+            reqmir =f[colidx["required_mirror_free_gb"]]+0
+            offdsk =f[colidx["offline_disks"]]+0
+            color  =f[colidx["color"]]
+            printf "<tr class=\"r-%s\">\n", tolower(color)
+            printf "<td class=\"mono\">%s</td><td>%s</td><td>%s</td>\n", htmlesc(dg), htmlesc(state), htmlesc(rtype)
+            printf "<td class=\"num\">%.2f</td><td class=\"num\">%.2f</td><td class=\"num\">%.1f%%</td>\n", totgb, freegb, pctused
+            printf "<td class=\"num\">%.2f</td><td class=\"num\">%.2f</td><td class=\"num\">%d</td>\n", usable, reqmir, offdsk
+            printf "<td><span class=\"badge b-%s\">%s</span></td></tr>\n", tolower(color), color
+        }
+        printf "</tbody></table></div></div>\n"
     }
 }
 AWKEOF
@@ -983,21 +1149,19 @@ AWKEOF
 write_html_templates
 }
 
+
 # ===========================================================================
-# Static HTML/CSS/JS fragments. Header metadata (__DB_NAME__ etc.) is filled
-# in later via a literal awk gsub pass - kept out of these heredocs so this
-# text never has to be shell-interpolated (avoids sed-delimiter and
-# heredoc-quoting pitfalls with the embedded CSS/JS).
+# HTML/CSS/JS templates
 # ===========================================================================
 write_html_templates() {
 
-cat > "${WORKDIR}/template_a.html" <<'HTMLEOF'
+cat > "${WORKDIR}/template_head.html" <<'HTMLEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tablespace Capacity Report - __DB_NAME__</title>
+<title>Tablespace Capacity Report - __REPORT_TAG__</title>
 <style>
 :root{
   --bg:#11161c; --panel:#161d26; --panel2:#1c2530; --border:#27313d;
@@ -1005,242 +1169,182 @@ cat > "${WORKDIR}/template_a.html" <<'HTMLEOF'
   --red:#ef5765; --red-bg:rgba(239,87,101,.14);
   --amber:#f5a623; --amber-bg:rgba(245,166,35,.14);
   --green:#36c98f; --green-bg:rgba(54,201,143,.14);
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
-  --sans: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace,"SF Mono","Cascadia Mono","Consolas",monospace;
+  --sans: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 }
-*{box-sizing:border-box;}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;}
-a{color:var(--accent);}
-.topbar{padding:24px 28px 18px;border-bottom:1px solid var(--border);}
-.topbar h1{margin:0 0 6px;font-size:20px;font-weight:650;letter-spacing:.2px;}
-.meta{color:var(--text-dim);font-size:12.5px;font-family:var(--mono);}
-.meta span{margin-right:18px;}
-.wrap{padding:20px 28px 48px;max-width:1320px;margin:0 auto;}
-.cards{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px;}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 18px;min-width:160px;flex:1;}
-.card .n{font-family:var(--mono);font-size:26px;font-weight:600;}
-.card .l{color:var(--text-dim);font-size:12px;margin-top:3px;}
-.card.red .n{color:var(--red);}
-.card.amber .n{color:var(--amber);}
-.card.green .n{color:var(--green);}
-.callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:8px;padding:11px 16px;margin-bottom:24px;font-size:13px;color:var(--text-dim);}
-.callout b{color:var(--text);}
-.section-h{display:flex;align-items:center;justify-content:space-between;margin:30px 0 10px;flex-wrap:wrap;gap:10px;}
-.section-h h2{font-size:13px;margin:0;text-transform:uppercase;letter-spacing:.7px;color:var(--text-dim);font-weight:700;}
-.search{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:7px 11px;font-size:13px;width:240px;}
-.search::placeholder{color:var(--text-dim);}
-.search:focus{outline:2px solid var(--accent);outline-offset:1px;}
-.tablewrap{border:1px solid var(--border);border-radius:10px;overflow:auto;max-height:65vh;}
-table{border-collapse:collapse;width:100%;font-size:13px;}
-thead th{position:sticky;top:0;background:var(--panel2);color:var(--text-dim);text-align:left;padding:10px 12px;font-weight:600;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;}
-thead th:hover{color:var(--text);}
-thead th:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
-thead th.sorted-asc::after{content:" \25B2";font-size:9px;position:relative;top:-1px;}
-thead th.sorted-desc::after{content:" \25BC";font-size:9px;position:relative;top:-1px;}
-tbody td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:middle;}
-tbody tr:hover{background:var(--panel);}
-.mono{font-family:var(--mono);}
-.num{font-family:var(--mono);text-align:right;}
-.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;letter-spacing:.4px;}
-.badge.b-red{background:var(--red-bg);color:var(--red);}
-.badge.b-amber{background:var(--amber-bg);color:var(--amber);}
-.badge.b-green{background:var(--green-bg);color:var(--green);}
-.pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;background:var(--panel2);color:var(--text-dim);}
-.pill.p-up{color:var(--amber);}
-.pill.p-down{color:var(--accent);}
-.pill.p-stable{color:var(--text-dim);}
-.barcell{min-width:130px;}
-.bar{background:var(--panel2);border-radius:4px;height:7px;width:90px;display:inline-block;overflow:hidden;vertical-align:middle;}
-.barfill{height:100%;}
-.bf-red{background:var(--red);}
-.bf-amber{background:var(--amber);}
-.bf-green{background:var(--green);}
-.barlabel{font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin-left:8px;}
-.tip{position:relative;}
-.tip[data-tip]:hover::after{
-  content:attr(data-tip);
-  position:absolute;left:0;bottom:120%;
-  background:#0a0d11;color:var(--text);
-  border:1px solid var(--border);
-  padding:7px 10px;border-radius:6px;
-  font-size:11.5px;font-family:var(--sans);
-  white-space:normal;width:230px;z-index:20;
-  box-shadow:0 6px 18px rgba(0,0,0,.45);
-}
-th.tip[data-tip]:hover::after{bottom:auto;top:120%;}
-.note{color:var(--text-dim);font-size:13px;padding:14px 0;}
-footer{margin-top:34px;padding-top:16px;border-top:1px solid var(--border);color:var(--text-dim);font-size:12px;}
-footer code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px;}
-footer ul{margin:8px 0;padding-left:18px;}
-@media (max-width:720px){ .cards{flex-direction:column;} .search{width:100%;} }
-@media (prefers-reduced-motion: reduce){ *{transition:none !important;} }
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45}
+.topbar{padding:22px 28px 16px;border-bottom:1px solid var(--border)}
+.topbar h1{margin:0 0 6px;font-size:19px;font-weight:650}
+.meta{color:var(--text-dim);font-size:12px;font-family:var(--mono)}
+.meta span{margin-right:18px}
+.wrap{padding:20px 28px 48px;max-width:1360px;margin:0 auto}
+/* Cards */
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:13px 17px;min-width:150px;flex:1}
+.card .n{font-family:var(--mono);font-size:24px;font-weight:600}
+.card .l{color:var(--text-dim);font-size:12px;margin-top:3px}
+.card.red .n{color:var(--red)} .card.amber .n{color:var(--amber)} .card.green .n{color:var(--green)}
+/* Callout */
+.callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 15px;margin-bottom:22px;font-size:13px;color:var(--text-dim)}
+.callout b{color:var(--text)} .callout-warn{border-left-color:var(--amber)}
+/* Section headings */
+.section-h{display:flex;align-items:center;justify-content:space-between;margin:28px 0 10px;flex-wrap:wrap;gap:8px}
+.section-h h2{font-size:12.5px;margin:0;text-transform:uppercase;letter-spacing:.7px;color:var(--text-dim);font-weight:700}
+/* Tabs */
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:8px}
+.tab-btn{background:var(--panel);border:1px solid var(--border);color:var(--text-dim);border-radius:7px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit;transition:background .15s}
+.tab-btn:hover{background:var(--panel2);color:var(--text)}
+.tab-btn.active{background:var(--panel2);color:var(--text);border-color:var(--accent)}
+.tab-btn:focus-visible{outline:2px solid var(--accent)}
+.tab-panel{display:none} .tab-panel.active{display:block}
+.tbadge{display:inline-block;padding:1px 6px;border-radius:99px;font-size:10px;font-weight:700;margin-left:4px}
+/* Per-tab db meta line */
+.db-meta{font-size:12px;color:var(--text-dim);margin-bottom:8px;font-family:var(--mono)}
+/* Search */
+.search{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:7px 11px;font-size:13px;width:260px;margin-bottom:10px;display:block}
+.search::placeholder{color:var(--text-dim)} .search:focus{outline:2px solid var(--accent)}
+/* Table */
+.tablewrap{border:1px solid var(--border);border-radius:10px;overflow:auto;max-height:62vh}
+table{border-collapse:collapse;width:100%;font-size:13px}
+thead th{position:sticky;top:0;background:var(--panel2);color:var(--text-dim);text-align:left;padding:9px 11px;font-weight:600;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
+thead th:hover{color:var(--text)}
+thead th.sorted-asc::after{content:" \25B2";font-size:9px}
+thead th.sorted-desc::after{content:" \25BC";font-size:9px}
+tbody td{padding:8px 11px;border-bottom:1px solid var(--border);vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel)}
+.mono{font-family:var(--mono)} .num{font-family:var(--mono);text-align:right}
+.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;letter-spacing:.3px}
+.badge.b-red,.tbadge.b-red{background:var(--red-bg);color:var(--red)}
+.badge.b-amber,.tbadge.b-amber{background:var(--amber-bg);color:var(--amber)}
+.badge.b-green,.tbadge.b-green{background:var(--green-bg);color:var(--green)}
+.pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11.5px;background:var(--panel2);color:var(--text-dim)}
+.pill.p-up{color:var(--amber)} .pill.p-down{color:var(--accent)} .pill.p-stable{color:var(--text-dim)}
+/* Bar */
+.barcell{min-width:120px}
+.bar{background:var(--panel2);border-radius:4px;height:7px;width:84px;display:inline-block;overflow:hidden;vertical-align:middle}
+.barfill{height:100%}
+.bf-red{background:var(--red)} .bf-amber{background:var(--amber)} .bf-green{background:var(--green)}
+.barlabel{font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-left:7px}
+/* Row colours */
+.r-red td{background:rgba(239,87,101,.04)} .r-amber td{background:rgba(245,166,35,.04)}
+/* Tooltip */
+.tip{position:relative}
+.tip[data-tip]:hover::after{content:attr(data-tip);position:absolute;left:0;bottom:120%;background:#0a0d11;color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font-size:11.5px;font-family:var(--sans);white-space:normal;width:220px;z-index:30;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+th.tip[data-tip]:hover::after{bottom:auto;top:120%}
+.note{color:var(--text-dim);font-size:13px;padding:12px 0}
+footer{margin-top:30px;padding-top:14px;border-top:1px solid var(--border);color:var(--text-dim);font-size:12px}
+footer code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px}
+@media(max-width:720px){.cards{flex-direction:column}.search{width:100%}}
+@media(prefers-reduced-motion:reduce){*{transition:none !important}}
 </style>
 </head>
 <body>
 <div class="topbar">
   <h1>Oracle Tablespace Capacity &amp; Growth Report</h1>
   <div class="meta">
-    <span>DB: __DB_NAME__</span><span>Mode: __MODE__</span><span>Generated: __GENERATED_AT__</span><span>Tag: __TAG__</span><span>Generator v__VERSION__</span>
+    <span>Tag: <b>__REPORT_TAG__</b></span>
+    <span>Generated: __GENERATED_AT__</span>
+    <span>Generator v__VERSION__</span>
   </div>
 </div>
 <div class="wrap">
-<div class="cards">
 HTMLEOF
 
-cat > "${WORKDIR}/template_b.html" <<'HTMLEOF'
-<div class="section-h">
-  <h2>Tablespaces</h2>
-  <input class="search" type="text" placeholder="Filter by PDB or tablespace..." data-filter-target="#tbsp-body">
-</div>
-<div class="tablewrap">
-<table data-sortable>
-<thead>
-<tr>
-<th class="tip" data-tip="Pluggable database / container. Shows N/A for non-CDB databases.">PDB</th>
-<th class="tip" data-tip="Tablespace name.">Tablespace</th>
-<th data-type="num" class="tip" data-tip="Number of datafiles. Smallfile tablespaces are capped at 1023 files; status turns AMBER above 800 and RED above 900.">Datafiles</th>
-<th data-type="num" class="tip" data-tip="Sum of current datafile sizes.">Allocated (GB)</th>
-<th data-type="num" class="tip" data-tip="Allocated minus current free space.">Used (GB)</th>
-<th data-type="num" class="tip" data-tip="Free space inside existing datafiles.">Free (GB)</th>
-<th data-type="num" class="tip" data-tip="Estimated extra space obtainable by adding more datafiles, assuming up to 1023 files at up to ~32GB each (8K block size).">Addable (GB)</th>
-<th data-type="num" class="tip" data-tip="Used GB as a percentage of allocated GB.">Used %</th>
-<th data-type="num" class="tip" data-tip="Average weekly growth in GB over roughly the trailing 26 weeks of AWR history.">Avg Weekly Growth (GB)</th>
-<th class="tip" data-tip="INCREASING / DECREASING (PURGING) / STABLE, based on total growth over the observed period.">Trend</th>
-<th data-type="num" class="tip" data-tip="Estimated weeks until full at the current average growth rate, including addable datafile space. Hover a row's value for the exact note.">Sustainable (wks)</th>
-<th class="tip" data-tip="RED: more than 900 datafiles. AMBER: more than 800. GREEN: otherwise.">Status</th>
-</tr>
-</thead>
-<tbody id="tbsp-body">
-HTMLEOF
-
-cat > "${WORKDIR}/template_c.html" <<'HTMLEOF'
-</tbody>
-</table>
-</div>
-HTMLEOF
-
-cat > "${WORKDIR}/template_asm_head.html" <<'HTMLEOF'
-<div class="section-h">
-  <h2>ASM Diskgroups</h2>
-  <input class="search" type="text" placeholder="Filter by diskgroup..." data-filter-target="#asm-body">
-</div>
-<div class="tablewrap">
-<table data-sortable>
-<thead>
-<tr>
-<th class="tip" data-tip="ASM diskgroup name.">Diskgroup</th>
-<th class="tip" data-tip="MOUNTED / DISMOUNTED / etc.">State</th>
-<th class="tip" data-tip="EXTERNAL, NORMAL, HIGH, or FLEX redundancy.">Redundancy</th>
-<th data-type="num" class="tip" data-tip="Raw total diskgroup capacity.">Total (GB)</th>
-<th data-type="num" class="tip" data-tip="Raw free space before accounting for mirroring overhead.">Free (GB)</th>
-<th data-type="num" class="tip" data-tip="(Total - Free) / Total.">Used %</th>
-<th data-type="num" class="tip" data-tip="USABLE_FILE_MB: space actually usable for new files once redundancy/mirroring overhead is accounted for - the more realistic free-space figure for NORMAL/HIGH redundancy diskgroups.">Usable Free (GB)</th>
-<th data-type="num" class="tip" data-tip="Minimum free space ASM must keep available to restore full redundancy after a disk failure.">Required Mirror Free (GB)</th>
-<th data-type="num" class="tip" data-tip="Disks currently offline in this diskgroup.">Offline Disks</th>
-<th class="tip" data-tip="RED: usable free below 10% of total. AMBER: below 20%. GREEN: otherwise.">Status</th>
-</tr>
-</thead>
-<tbody id="asm-body">
-HTMLEOF
-
-cat > "${WORKDIR}/template_asm_tail.html" <<'HTMLEOF'
-</tbody>
-</table>
-</div>
-HTMLEOF
-
-cat > "${WORKDIR}/template_d.html" <<'HTMLEOF'
+cat > "${WORKDIR}/template_foot.html" <<'HTMLEOF'
 <footer>
-  <p>Assumptions baked into this report: smallfile tablespace limit of 1023 datafiles, up to ~32GB per datafile (8K block size); datafile-count status thresholds RED &gt;900 / AMBER &gt;800; growth figures derived from roughly the trailing 26 weeks of AWR history in <code>dba_hist_tbspc_space_usage</code> / <code>cdb_hist_tbspc_space_usage</code> (requires Diagnostics Pack); ASM status thresholds RED &lt;10% / AMBER &lt;20% usable free space.</p>
-  <p>Generated by <code>tbsp_report.sh</code>. See the accompanying CSV file(s) for the underlying data and README.md for prerequisites and customization notes.</p>
+  <p>Assumptions: smallfile tablespace limit 1023 datafiles, up to ~32GB/file (8K block size); status RED &gt;900 files / AMBER &gt;800; growth from trailing 26 weeks of AWR history in <code>dba_hist_tbspc_space_usage</code> / <code>cdb_hist_tbspc_space_usage</code> (Diagnostics Pack required); ASM status RED &lt;10% / AMBER &lt;20% usable free space.</p>
+  <p>Generated by <code>tbsp_report.sh</code>. See accompanying CSV file(s) for raw data.</p>
 </footer>
 </div>
 <script>
 (function(){
-  function norm(s){ return s.trim().toLowerCase(); }
-  document.querySelectorAll('table[data-sortable]').forEach(function(table){
-    var thead = table.tHead, tbody = table.tBodies[0];
-    Array.prototype.forEach.call(thead.querySelectorAll('th'), function(th, idx){
-      th.setAttribute('tabindex', '0');
-      function doSort(){
-        var type = th.getAttribute('data-type') || 'text';
-        var asc = !th.classList.contains('sorted-asc');
-        Array.prototype.forEach.call(thead.querySelectorAll('th'), function(h){ h.classList.remove('sorted-asc','sorted-desc'); });
-        th.classList.add(asc ? 'sorted-asc' : 'sorted-desc');
-        var rows = Array.prototype.slice.call(tbody.rows);
-        rows.sort(function(a, b){
-          var va = a.cells[idx].textContent, vb = b.cells[idx].textContent;
-          if (type === 'num'){
-            va = parseFloat(va); if (isNaN(va)) va = -Infinity;
-            vb = parseFloat(vb); if (isNaN(vb)) vb = -Infinity;
-            return asc ? va - vb : vb - va;
+  // Tab switching
+  document.querySelectorAll('.tabs').forEach(function(tabs){
+    tabs.querySelectorAll('.tab-btn').forEach(function(btn){
+      btn.addEventListener('click',function(){
+        var tid=btn.getAttribute('data-tab')
+        tabs.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active')})
+        btn.classList.add('active')
+        // find sibling tab panels (next siblings of tabs container)
+        var el=tabs.nextElementSibling
+        while(el && (el.classList.contains('tab-panel')||el.tagName==='DIV')){
+          if(el.classList.contains('tab-panel')){
+            el.classList.toggle('active', el.id===tid)
           }
-          va = norm(va); vb = norm(vb);
-          if (va < vb) return asc ? -1 : 1;
-          if (va > vb) return asc ? 1 : -1;
-          return 0;
-        });
-        rows.forEach(function(r){ tbody.appendChild(r); });
+          el=el.nextElementSibling
+        }
+      })
+    })
+  })
+  // Column sort
+  document.querySelectorAll('table[data-sortable]').forEach(function(t){
+    var tb=t.tBodies[0]
+    Array.prototype.forEach.call(t.tHead.querySelectorAll('th'),function(th,idx){
+      th.tabIndex=0
+      function sort(){
+        var type=th.getAttribute('data-type')||'text'
+        var asc=!th.classList.contains('sorted-asc')
+        Array.prototype.forEach.call(t.tHead.querySelectorAll('th'),function(h){h.classList.remove('sorted-asc','sorted-desc')})
+        th.classList.add(asc?'sorted-asc':'sorted-desc')
+        Array.prototype.slice.call(tb.rows).sort(function(a,b){
+          var va=a.cells[idx].textContent, vb=b.cells[idx].textContent
+          if(type==='num'){va=parseFloat(va)||(-Infinity);vb=parseFloat(vb)||(-Infinity);return asc?va-vb:vb-va}
+          va=va.trim().toLowerCase();vb=vb.trim().toLowerCase()
+          return asc?(va<vb?-1:va>vb?1:0):(vb<va?-1:vb>va?1:0)
+        }).forEach(function(r){tb.appendChild(r)})
       }
-      th.addEventListener('click', doSort);
-      th.addEventListener('keypress', function(e){ if (e.key === 'Enter' || e.key === ' ') doSort(); });
-    });
-  });
-
-  Array.prototype.forEach.call(document.querySelectorAll('input[data-filter-target]'), function(inp){
-    var tbody = document.querySelector(inp.getAttribute('data-filter-target'));
-    if (!tbody) return;
-    inp.addEventListener('input', function(){
-      var q = norm(inp.value);
-      Array.prototype.forEach.call(tbody.rows, function(r){
-        var pdb = norm(r.getAttribute('data-pdb') || '');
-        var ts  = norm(r.getAttribute('data-ts') || '');
-        var hay = pdb + ' ' + ts + ' ' + norm(r.textContent);
-        r.style.display = (!q || hay.indexOf(q) > -1) ? '' : 'none';
-      });
-    });
-  });
-})();
+      th.addEventListener('click',sort)
+      th.addEventListener('keypress',function(e){if(e.key==='Enter'||e.key===' ')sort()})
+    })
+  })
+  // Search/filter
+  document.querySelectorAll('input[data-filter-target]').forEach(function(inp){
+    var tb=document.querySelector(inp.getAttribute('data-filter-target'))
+    if(!tb)return
+    inp.addEventListener('input',function(){
+      var q=inp.value.trim().toLowerCase()
+      Array.prototype.forEach.call(tb.rows,function(r){
+        var hay=(r.getAttribute('data-pdb')||'')+(r.getAttribute('data-ts')||'')+r.textContent
+        r.style.display=(!q||hay.toLowerCase().indexOf(q)>-1)?'':'none'
+      })
+    })
+  })
+})()
 </script>
-</body>
-</html>
+</body></html>
 HTMLEOF
 }
 
+
 # ===========================================================================
-# PDB filtering (post-hoc, on the CSV - see header comment for rationale)
+# PDB post-filter (CDB mode, applied to raw per-run CSV before merging)
 # ===========================================================================
 filter_pdb() {
     _csv=$1
-    if [ "$CDB_MODE" != "YES" ] || [ "$PDB_FILTER" = "ALL" ]; then
-        return 0
-    fi
-    _awk="${WORKDIR}/filter_pdb.awk"
-    cat > "$_awk" <<'AWKEOF'
-NR == 1 {
-    ncols = csv_split($0, hdr)
-    for (i = 1; i <= ncols; i++) if (hdr[i] == "pdb_name") col = i
-    print
-    next
-}
-$0 == "" { next }
-{
-    n = csv_split($0, f)
-    if (toupper(f[col]) == toupper(pdb)) print
-}
-AWKEOF
-    _tmp="${_csv}.filtered"
-    awk -v pdb="$PDB_FILTER" -f "${WORKDIR}/csvlib.awk" -f "$_awk" "$_csv" > "$_tmp"
-    _kept=$(( $(wc -l < "$_tmp") - 1 ))
-    [ "$_kept" -lt 0 ] && _kept=0
+    if [ "$CDB_MODE" != "YES" ] || [ "$PDB_FILTER" = "ALL" ]; then return 0; fi
+    _tmp="${_csv}.fpdb.$$"
+    awk -v pdb="$PDB_FILTER" '
+    NR==1 {
+        ncols=split($0,hdr,","); for(i=1;i<=ncols;i++){h=hdr[i];gsub(/"/,"",h);if(tolower(h)=="pdb_name")col=i}
+        print; next
+    }
+    {
+        n=split($0,f,","); v=f[col]; gsub(/"/,"",v)
+        if (toupper(v)==toupper(pdb)) print
+    }' "$_csv" > "$_tmp"
+    _kept=$(( $(wc -l < "$_tmp") - 1 )); [ "$_kept" -lt 0 ] && _kept=0
     mv "$_tmp" "$_csv"
-    info "PDB filter '$PDB_FILTER' applied: $_kept tablespace row(s) kept."
+    info "PDB filter '$PDB_FILTER' applied: $_kept row(s) kept."
 }
 
 # ===========================================================================
 # Main
 # ===========================================================================
 EXIT_CODE=0
+TODAY=$(date '+%Y-%m-%d')
+RUN_TS_DISPLAY=$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
 
 if ! detect_db; then
     die "Could not determine target database / CDB mode. Aborting." 2
@@ -1249,7 +1353,7 @@ fi
 DB_LABEL=$(printf '%s' "$DB_NAME" | tr -c 'A-Za-z0-9' '_')
 
 write_sql_templates
-write_report_assets
+write_report_assets   # writes awk files + html templates into WORKDIR
 
 if [ "$CDB_MODE" = "YES" ]; then
     REPORT_MODE_LABEL="CDB"
@@ -1260,68 +1364,88 @@ else
     SQL_TO_RUN="$NONCDB_SQL"
 fi
 
-TBSP_CSV_RAW="${WORKDIR}/tbsp_raw.csv"
-if ! run_sql_to_csv "$CONNECT_STR" "$SQL_TO_RUN" "$TBSP_CSV_RAW" "Tablespace capacity/growth"; then
-    die "Tablespace capacity/growth query failed. See log above for the SQL*Plus error. Nothing was written to $OUTDIR." 3
+# ---- Determine output file names (tag-based when -N given) ----
+if [ -n "$TAG" ]; then
+    MASTER_TBSP_CSV="${OUTDIR}/${TAG}_tbsp_capacity.csv"
+    MASTER_ASM_CSV="${OUTDIR}/${TAG}_asm_diskgroup.csv"
+    HTML_OUT="${OUTDIR}/${TAG}_capacity_report.html"
+    RUNLOG_OUT="${OUTDIR}/${TAG}_$(date '+%Y%m%d_%H%M%S').log"
+else
+    MASTER_TBSP_CSV="${OUTDIR}/${DB_LABEL}_tbsp_capacity_${RUN_TS}.csv"
+    MASTER_ASM_CSV="${OUTDIR}/${DB_LABEL}_asm_diskgroup_${RUN_TS}.csv"
+    HTML_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.html"
+    RUNLOG_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.log"
 fi
-filter_pdb "$TBSP_CSV_RAW"
 
-RUN_TS_DISPLAY=$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
-TBSP_CSV_OUT="${OUTDIR}/${DB_LABEL}_tbsp_capacity_${RUN_TS}${TAG_SFX}.csv"
-cp "$TBSP_CSV_RAW" "$TBSP_CSV_OUT" || die "Could not write $TBSP_CSV_OUT" 2
-info "Tablespace CSV written: $TBSP_CSV_OUT"
+# ---- Run tablespace query -> raw CSV -> add date -> merge into master ----
+TBSP_RAW="${WORKDIR}/tbsp_raw.csv"
+if ! run_sql_to_csv "$CONNECT_STR" "$SQL_TO_RUN" "$TBSP_RAW" "Tablespace capacity/growth"; then
+    die "Tablespace capacity/growth query failed. See log above. Nothing written to $OUTDIR." 3
+fi
+filter_pdb "$TBSP_RAW"
 
-ASM_OK=1
-ASM_CSV_OUT=""
+TBSP_DATED="${WORKDIR}/tbsp_dated.csv"
+add_date_column "$TBSP_RAW" "$TBSP_DATED" "$TODAY"
+update_master_csv "$MASTER_TBSP_CSV" "$TBSP_DATED" "$TODAY" "$DB_NAME"
+
+# ---- ASM query -> raw CSV -> add date+db_name -> merge into master ----
+ASM_OK=1; ASM_CSV_OUT=""
 if [ "$SKIP_ASM" -eq 1 ]; then
     info "ASM diskgroup section skipped (-x)."
 else
-    ASM_CSV_RAW="${WORKDIR}/asm_raw.csv"
-    if run_asm_query "$ASM_CSV_RAW"; then
+    ASM_RAW="${WORKDIR}/asm_raw.csv"
+    if run_asm_query "$ASM_RAW"; then
         ASM_OK=0
-        ASM_CSV_OUT="${OUTDIR}/${DB_LABEL}_asm_diskgroup_${RUN_TS}${TAG_SFX}.csv"
-        cp "$ASM_CSV_RAW" "$ASM_CSV_OUT" || die "Could not write $ASM_CSV_OUT" 2
-        info "ASM diskgroup CSV written: $ASM_CSV_OUT"
+        ASM_DATED="${WORKDIR}/asm_dated.csv"
+        add_date_column "$ASM_RAW" "$ASM_DATED" "$TODAY" "$DB_NAME"
+        update_master_csv "$MASTER_ASM_CSV" "$ASM_DATED" "$TODAY" "$DB_NAME"
+        ASM_CSV_OUT="$MASTER_ASM_CSV"
     fi
 fi
 
-# ---- Generate dynamic HTML fragments from the CSV data ----
-TS_ROWS="${WORKDIR}/ts_rows.html"
-TS_SUMMARY="${WORKDIR}/ts_summary.txt"
+# ---- Generate HTML from master CSVs ----
+TS_TABS="${WORKDIR}/ts_tab_btns.html"
+TS_PANELS="${WORKDIR}/ts_panels.html"
 TS_CARDS="${WORKDIR}/ts_cards.html"
 TS_CALLOUT="${WORKDIR}/ts_callout.html"
-awk -v summaryfile="$TS_SUMMARY" -v cardsfile="$TS_CARDS" -v calloutfile="$TS_CALLOUT" \
-    -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_tbsp_rows.awk" "$TBSP_CSV_RAW" > "$TS_ROWS"
+TS_SUMMARY="${WORKDIR}/ts_summary.txt"
 
-TS_TOTAL=0; TS_RED=0; TS_AMBER=0; TS_GREEN=0
+awk -v tabsfile="$TS_TABS" -v cardsfile="$TS_CARDS" \
+    -v calloutfile="$TS_CALLOUT" -v summaryfile="$TS_SUMMARY" \
+    -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_tabs.awk" \
+    "$MASTER_TBSP_CSV" > "$TS_PANELS"
+
+TS_TOTAL=0; TS_RED=0; TS_AMBER=0; TS_GREEN=0; DB_COUNT=0
 TOP1=""; TOP2=""; TOP3=""
 if [ -s "$TS_SUMMARY" ]; then
     while IFS='=' read -r _k _v; do
         case "$_k" in
-            TS_TOTAL) TS_TOTAL=$_v ;;
-            TS_RED)   TS_RED=$_v ;;
-            TS_AMBER) TS_AMBER=$_v ;;
-            TS_GREEN) TS_GREEN=$_v ;;
-            TOP1)     TOP1=$_v ;;
-            TOP2)     TOP2=$_v ;;
-            TOP3)     TOP3=$_v ;;
+            TS_TOTAL)  TS_TOTAL=$_v  ;;
+            TS_RED)    TS_RED=$_v    ;;
+            TS_AMBER)  TS_AMBER=$_v  ;;
+            TS_GREEN)  TS_GREEN=$_v  ;;
+            DB_COUNT)  DB_COUNT=$_v  ;;
+            TOP1)      TOP1=$_v      ;;
+            TOP2)      TOP2=$_v      ;;
+            TOP3)      TOP3=$_v      ;;
         esac
     done < "$TS_SUMMARY"
 fi
 
+ASM_TABS="${WORKDIR}/asm_tab_btns.html"; : > "$ASM_TABS"
+ASM_PANELS="${WORKDIR}/asm_panels.html"; : > "$ASM_PANELS"
+ASM_CARDS="${WORKDIR}/asm_cards.html";  : > "$ASM_CARDS"
+ASM_SUMMARY="${WORKDIR}/asm_summary.txt"
 ASM_TOTAL=0; ASM_RED=0; ASM_AMBER=0; ASM_GREEN=0
-ASM_ROWS="${WORKDIR}/asm_rows.html"
-ASM_CARDS="${WORKDIR}/asm_cards.html"
-: > "$ASM_CARDS"
 if [ "$ASM_OK" -eq 0 ]; then
-    ASM_SUMMARY="${WORKDIR}/asm_summary.txt"
-    awk -v summaryfile="$ASM_SUMMARY" -v cardsfile="$ASM_CARDS" \
-        -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_asm_rows.awk" "$ASM_CSV_RAW" > "$ASM_ROWS"
+    awk -v tabsfile="$ASM_TABS" -v cardsfile="$ASM_CARDS" -v summaryfile="$ASM_SUMMARY" \
+        -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_asm_tabs.awk" \
+        "$MASTER_ASM_CSV" > "$ASM_PANELS"
     if [ -s "$ASM_SUMMARY" ]; then
         while IFS='=' read -r _k _v; do
             case "$_k" in
                 ASM_TOTAL) ASM_TOTAL=$_v ;;
-                ASM_RED)   ASM_RED=$_v ;;
+                ASM_RED)   ASM_RED=$_v   ;;
                 ASM_AMBER) ASM_AMBER=$_v ;;
                 ASM_GREEN) ASM_GREEN=$_v ;;
             esac
@@ -1329,64 +1453,57 @@ if [ "$ASM_OK" -eq 0 ]; then
     fi
 fi
 
-# ---- Fill header metadata tokens in template_a.html ----
-FILLED_A="${WORKDIR}/filled_a.html"
-awk -v dbname="$DB_NAME" -v gen="$RUN_TS_DISPLAY" -v mode="$REPORT_MODE_LABEL" \
-    -v tag="${TAG:-none}" -v ver="$SCRIPT_VERSION" '
-{
-    gsub(/__DB_NAME__/, dbname)
-    gsub(/__GENERATED_AT__/, gen)
-    gsub(/__MODE__/, mode)
-    gsub(/__TAG__/, tag)
-    gsub(/__VERSION__/, ver)
-    print
-}' "${WORKDIR}/template_a.html" > "$FILLED_A"
+# ---- Fill tokens in head template ----
+REPORT_TAG="${TAG:-${DB_LABEL}}"
+FILLED_HEAD="${WORKDIR}/head.html"
+awk -v rtag="$REPORT_TAG" -v gen="$RUN_TS_DISPLAY" -v ver="$SCRIPT_VERSION" '
+{ gsub(/__REPORT_TAG__/,rtag); gsub(/__GENERATED_AT__/,gen); gsub(/__VERSION__/,ver); print }
+' "${WORKDIR}/template_head.html" > "$FILLED_HEAD"
 
-# ---- Assemble the final HTML in order ----
-HTML_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}${TAG_SFX}.html"
+# ---- Assemble final HTML ----
 {
-    cat "$FILLED_A"
+    cat "$FILLED_HEAD"
+    # Cards row
+    printf '<div class="cards">\n'
     cat "$TS_CARDS"
-    [ "$ASM_OK" -eq 0 ] && cat "$ASM_CARDS"
+    [ -s "$ASM_CARDS" ] && cat "$ASM_CARDS"
     printf '</div>\n'
+    # Callout
     cat "$TS_CALLOUT"
-    cat "${WORKDIR}/template_b.html"
-    cat "$TS_ROWS"
-    cat "${WORKDIR}/template_c.html"
+    # Tablespace section
+    printf '<div class="section-h"><h2>Tablespaces</h2></div>\n'
+    printf '<div class="tabs">\n'; cat "$TS_TABS"; printf '</div>\n'
+    cat "$TS_PANELS"
+    # ASM section
     if [ "$ASM_OK" -eq 0 ]; then
-        cat "${WORKDIR}/template_asm_head.html"
-        cat "$ASM_ROWS"
-        cat "${WORKDIR}/template_asm_tail.html"
+        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n'
+        printf '<div class="tabs">\n'; cat "$ASM_TABS"; printf '</div>\n'
+        cat "$ASM_PANELS"
     else
-        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">ASM diskgroup data not available for this run (this database may not use ASM storage, the query failed, or -x was used). See the run log for details.</p>\n'
+        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">ASM data not available (database may use filesystem storage, query failed, or -x used). See the run log for details.</p>\n'
     fi
-    cat "${WORKDIR}/template_d.html"
+    cat "${WORKDIR}/template_foot.html"
 } > "$HTML_OUT"
 info "HTML report written: $HTML_OUT"
 
-# ---- Final summary ----
-info "Summary: $TS_TOTAL tablespace(s) evaluated - RED=$TS_RED AMBER=$TS_AMBER GREEN=$TS_GREEN"
-if [ "$ASM_OK" -eq 0 ]; then
-    info "ASM: $ASM_TOTAL diskgroup(s) evaluated - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
-else
-    [ "$SKIP_ASM" -eq 0 ] && EXIT_CODE=4
-fi
+# ---- Summary ----
+info "Tablespaces: $TS_TOTAL across $DB_COUNT DB(s) - RED=$TS_RED AMBER=$TS_AMBER GREEN=$TS_GREEN"
+[ "$ASM_OK" -eq 0 ] && info "ASM: $ASM_TOTAL diskgroup(s) - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
+[ "$ASM_OK" -ne 0 ] && [ "$SKIP_ASM" -eq 0 ] && EXIT_CODE=4
 
+# ---- Optional email: send today's slice of the master CSV ----
 MAIL_SENT=0
 if [ -n "$RECIPIENTS" ]; then
-    if send_report_email; then
-        MAIL_SENT=1
-    else
-        EXIT_CODE=5
-    fi
+    send_report_email && MAIL_SENT=1 || EXIT_CODE=5
 fi
 
-RUNLOG_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}${TAG_SFX}.log"
 cp "$LOGFILE" "$RUNLOG_OUT" 2>/dev/null
 
-printf '\nDone. Files written to %s:\n  %s\n' "$OUTDIR" "$TBSP_CSV_OUT"
-[ -n "$ASM_CSV_OUT" ] && printf '  %s\n' "$ASM_CSV_OUT"
-printf '  %s\n  %s\n' "$HTML_OUT" "$RUNLOG_OUT"
+printf '\nDone. Output directory: %s\n' "$OUTDIR"
+printf '  Tablespace CSV: %s\n' "$MASTER_TBSP_CSV"
+[ -n "$ASM_CSV_OUT" ] && printf '  ASM CSV:        %s\n' "$ASM_CSV_OUT"
+printf '  HTML report:    %s\n' "$HTML_OUT"
+printf '  Log:            %s\n' "$RUNLOG_OUT"
 [ "$MAIL_SENT" -eq 1 ] && printf '\nEmailed to: %s\n' "$RECIPIENTS"
 
 exit $EXIT_CODE
