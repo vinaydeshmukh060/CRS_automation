@@ -2,16 +2,23 @@
 #==============================================================================
 # tbsp_report.sh
 #
-# Oracle Tablespace Capacity & Growth Report (+ ASM diskgroup space), with
-# optional emailing of the result.
+# Oracle Tablespace Capacity & Growth Report (+ ASM diskgroup space) across
+# one or more databases, with a tab-per-database HTML report, and optional
+# emailing of the result.
 # ---------------------------------------------------------------------------
 # Portable across Solaris (SunOS) and Linux. CDB/non-CDB aware (Oracle 19c+).
 #
-# Generates:
-#   <tag>_tbsp_capacity_<ts>.csv     - tablespace capacity & growth data
-#   <tag>_asm_diskgroup_<ts>.csv     - ASM diskgroup space data (if available)
-#   <tag>_capacity_report_<ts>.html  - interactive HTML report (both sections)
-#   <tag>_capacity_report_<ts>.log   - run log
+# With -N TAG, all runs sharing that tag write into ONE consolidated CSV per
+# data type (<TAG>_tbsp_capacity.csv, <TAG>_asm_diskgroup.csv) and ONE HTML
+# report (<TAG>_capacity_report.html) with a tab per database. Each row is
+# stamped with run_date (the calendar day, local time) and db_name. If a
+# database already has a row for today under that tag, the script REFUSES
+# to query it again - it logs a warning and skips straight to regenerating
+# the HTML/email from what's already there. Delete the relevant row from
+# the CSV (or use a different -N tag) if you really need to re-run it today.
+#
+# Without -N, every run writes its own timestamped files and nothing is
+# merged, deduplicated, or refused - use this for one-off/ad hoc runs.
 #
 # ASM diskgroup space is read from V$ASM_DISKGROUP via the same connection
 # as everything else - the database instance's ASMB process mirrors this
@@ -19,9 +26,15 @@
 # sysasm" connection to the ASM/grid instance is needed (and on most sites
 # the DBA running this has no OS access to the grid home anyway).
 #
-# Emailing is optional: pass -r to also send the CSV(s)/HTML as attachments
+# Emailing is optional: pass -r to also send the CSV/HTML as attachments
 # once they're written, with a short plain-text summary in the body (no
-# HTML dump in the body). Without -r, nothing is emailed.
+# HTML dump in the body). With -N, the CSV attachment is today's rows only,
+# across all databases under that tag. Without -r, nothing is emailed.
+#
+# Email-only mode (-E): skips Oracle entirely (no sqlplus needed). Reads
+# the existing consolidated CSV(s) for -N TAG, regenerates the HTML fresh,
+# and emails it. Use this to (re)send a report without re-querying any
+# database - e.g. as a final step after several per-database cron runs.
 #
 # See README.md for full documentation, assumptions and prerequisites.
 #
@@ -30,11 +43,15 @@
 #   -c CONNECT_STR  SQL*Plus connect string (default: "/ as sysdba")
 #   -p PDB_NAME     For a CDB, restrict report to one PDB (default: ALL)
 #   -o OUTDIR       Output directory (default: current directory)
-#   -N TAG          Tag appended to CSV/HTML filenames and report title
+#   -N TAG          Consolidation tag - shared CSV/HTML across databases,
+#                    and the key used by -E to find existing data
 #   -x              Skip the ASM diskgroup section entirely
 #   -r RECIPIENTS   Comma-separated email recipients - if given, email the
 #                    report after generating it
 #   -f FROM_ADDR    From address for the email (default <user>@<hostname>)
+#   -E              Email-only mode: no Oracle connection. Requires -N and
+#                    -r. Reads the existing consolidated CSV(s), rebuilds
+#                    the HTML, and emails it.
 #   -h              Show this help and exit
 #
 # Exit codes: 0 ok, 1 usage/arg error, 2 environment/prereq error,
@@ -65,6 +82,7 @@ TAG=""
 SKIP_ASM=0
 RECIPIENTS=""
 FROM_ADDR=""
+EMAIL_ONLY=0
 
 # Paths to SQL files written by write_sql_templates() into WORKDIR
 NONCDB_SQL=""
@@ -89,7 +107,7 @@ LOGFILE=""
 # Generic helpers
 # ===========================================================================
 usage() {
-    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 ts_now() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -187,7 +205,7 @@ set_oracle_env_for_sid() {
 # ===========================================================================
 # Argument parsing
 # ===========================================================================
-while getopts ":s:c:p:o:N:xr:f:h" opt; do
+while getopts ":s:c:p:o:N:xr:f:Eh" opt; do
     case "$opt" in
         s) ORACLE_SID_OPT=$OPTARG ;;
         c) CONNECT_STR=$OPTARG ;;
@@ -197,6 +215,7 @@ while getopts ":s:c:p:o:N:xr:f:h" opt; do
         x) SKIP_ASM=1 ;;
         r) RECIPIENTS=$OPTARG ;;
         f) FROM_ADDR=$OPTARG ;;
+        E) EMAIL_ONLY=1 ;;
         h) usage; exit 0 ;;
         \?) printf 'Unknown option: -%s\n\n' "$OPTARG" >&2; usage; exit 1 ;;
         :) printf 'Option -%s requires an argument\n\n' "$OPTARG" >&2; usage; exit 1 ;;
@@ -216,18 +235,31 @@ esac
 # ===========================================================================
 # Setup
 # ===========================================================================
-if [ -n "$ORACLE_SID_OPT" ]; then
-    set_oracle_env_for_sid "$ORACLE_SID_OPT"
-fi
+if [ "$EMAIL_ONLY" -eq 1 ]; then
+    # No Oracle connection at all in this mode - just need somewhere to find
+    # the existing consolidated CSV(s) and someone to send the result to.
+    if [ -z "$TAG" ]; then
+        printf -- '-E (email-only mode) requires -N TAG, so the script knows which consolidated CSV to read.\n\n' >&2
+        usage; exit 1
+    fi
+    if [ -z "$RECIPIENTS" ]; then
+        printf -- '-E (email-only mode) requires -r RECIPIENTS - otherwise there is nothing for it to do.\n\n' >&2
+        usage; exit 1
+    fi
+else
+    if [ -n "$ORACLE_SID_OPT" ]; then
+        set_oracle_env_for_sid "$ORACLE_SID_OPT"
+    fi
 
-if [ -z "${ORACLE_SID:-}" ]; then
-    printf 'ORACLE_SID is not set and -s was not given. Pass -s <SID> or export ORACLE_SID first.\n' >&2
-    exit 1
-fi
+    if [ -z "${ORACLE_SID:-}" ]; then
+        printf 'ORACLE_SID is not set and -s was not given. Pass -s <SID> or export ORACLE_SID first.\n' >&2
+        exit 1
+    fi
 
-if ! command -v sqlplus >/dev/null 2>&1; then
-    printf "sqlplus not found on PATH (ORACLE_HOME=%s). Check the environment or use -s to select a SID.\n" "${ORACLE_HOME:-unset}" >&2
-    exit 2
+    if ! command -v sqlplus >/dev/null 2>&1; then
+        printf "sqlplus not found on PATH (ORACLE_HOME=%s). Check the environment or use -s to select a SID. (If you only want to (re)send an existing report by email, use -E -N <TAG> -r <recipients> instead - that mode needs no Oracle connection.)\n" "${ORACLE_HOME:-unset}" >&2
+        exit 2
+    fi
 fi
 
 if [ ! -d "$OUTDIR" ]; then
@@ -247,7 +279,11 @@ TAG_SFX=""
 [ -n "$TAG" ] && TAG_SFX="_${TAG}"
 
 info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (PID $RUN_PID) on host $(hostname 2>/dev/null) [$OS_TYPE]"
-info "ORACLE_SID=${ORACLE_SID} ORACLE_HOME=${ORACLE_HOME:-<inherited>}"
+if [ "$EMAIL_ONLY" -eq 1 ]; then
+    info "Mode: email-only (tag=$TAG, no Oracle connection)"
+else
+    info "ORACLE_SID=${ORACLE_SID} ORACLE_HOME=${ORACLE_HOME:-<inherited>}"
+fi
 
 # ===========================================================================
 # SQL execution helpers
@@ -852,6 +888,23 @@ extract_today_csv() {
     }' "$_master" > "$_out"
 }
 
+# Returns success (0) if the master CSV already has a row for (today, this
+# db) - used to refuse re-querying a database that's already been captured
+# today under this -N tag. A "day" is the local calendar date the run
+# finishes on.
+csv_has_today_db() {
+    _master=$1; _today=$2; _dbname=$3
+    [ -f "$_master" ] || return 1
+    awk -v today="$_today" -v db="$_dbname" '
+    NR==1 { next }
+    {
+        line=$0
+        f1=line; sub(/^"/, "", f1); sub(/".*/, "", f1)
+        rest=line; sub(/^"[^"]*","/, "", rest); f2=rest; sub(/".*/, "", f2)
+        if (f1 == today && f2 == db) { print "FOUND"; exit }
+    }' "$_master" | grep -q FOUND
+}
+
 
 # ===========================================================================
 # Report assets: awk libraries written to WORKDIR at runtime
@@ -861,6 +914,11 @@ write_report_assets() {
 # ---- Shared CSV parser (mawk/nawk/gawk portable) ----
 cat > "${WORKDIR}/csvlib.awk" <<'AWKEOF'
 function csv_split(line, arr,    i, c, field, inquote, n) {
+    # Defensive: strip a trailing CR in case the source ever has CRLF line
+    # endings (some sqlplus/NLS/terminal combinations introduce these even
+    # in redirected output) - left in place, a stray \r on the last field
+    # would silently break matching on that column.
+    sub(/\r$/, "", line)
     n=0; field=""; inquote=0
     for (i=1; i<=length(line); i++) {
         c=substr(line,i,1)
@@ -877,6 +935,14 @@ function csv_split(line, arr,    i, c, field, inquote, n) {
     }
     arr[++n]=field; return n
 }
+# Trims leading/trailing whitespace. Used specifically on CSV HEADER field
+# names before they become colidx[] lookup keys: SQL*Plus's CSV markup mode
+# can pad a column header with trailing spaces (inside the quotes) up to the
+# column's computed display width, which would otherwise make every
+# colidx["..."] lookup miss and silently render as 0/blank. Not applied to
+# ordinary data values, so legitimate leading/trailing spaces in real data
+# are left alone.
+function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
 function htmlesc(s) {
     gsub(/&/,"\\&amp;",s); gsub(/</,"\\&lt;",s)
     gsub(/>/,"\\&gt;",s);  gsub(/"/,"\\&quot;",s)
@@ -912,8 +978,13 @@ function offer_top3(sw, label) {
 
 NR==1 {
     ncols=csv_split($0,hdr)
-    # NOTE: sqlplus outputs column names in UPPERCASE; tolower() normalises them.
-    for (i=1;i<=ncols;i++) colidx[tolower(hdr[i])]=i
+    # NOTE: sqlplus outputs column names in UPPERCASE; tolower()+trim()
+    # normalises them (trim guards against SQL*Plus padding a header to a
+    # column's display width with trailing spaces inside the quotes).
+    for (i=1;i<=ncols;i++) colidx[tolower(trim(hdr[i]))]=i
+    if (!colidx["db_name"] || !colidx["tablespace_name"] || !colidx["allocated_gb"] || !colidx["color"]) {
+        print "WARN gen_tabs.awk: one or more expected columns not found in master CSV header - data will render as blank/zero. Raw header line was: " $0 > "/dev/stderr"
+    }
     next
 }
 $0=="" { next }
@@ -1061,7 +1132,10 @@ AWKEOF
 cat > "${WORKDIR}/gen_asm_tabs.awk" <<'AWKEOF'
 NR==1 {
     ncols=csv_split($0,hdr)
-    for (i=1;i<=ncols;i++) colidx[tolower(hdr[i])]=i
+    for (i=1;i<=ncols;i++) colidx[tolower(trim(hdr[i]))]=i
+    if (!colidx["db_name"] || !colidx["diskgroup_name"] || !colidx["total_gb"] || !colidx["color"]) {
+        print "WARN gen_asm_tabs.awk: one or more expected columns not found in master ASM CSV header - data will render as blank/zero. Raw header line was: " $0 > "/dev/stderr"
+    }
     next
 }
 $0=="" { next }
@@ -1340,70 +1414,113 @@ filter_pdb() {
 }
 
 # ===========================================================================
+# ===========================================================================
 # Main
 # ===========================================================================
 EXIT_CODE=0
 TODAY=$(date '+%Y-%m-%d')
 RUN_TS_DISPLAY=$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
 
-if ! detect_db; then
-    die "Could not determine target database / CDB mode. Aborting." 2
-fi
+SKIP_QUERY=0
+ASM_CSV_OUT=""
 
-DB_LABEL=$(printf '%s' "$DB_NAME" | tr -c 'A-Za-z0-9' '_')
+if [ "$EMAIL_ONLY" -eq 1 ]; then
+    # -------------------------------------------------------------------
+    # Email-only mode: no Oracle connection. -N and -r were already
+    # validated in the Setup section above.
+    # -------------------------------------------------------------------
+    DB_LABEL="$TAG"
+    REPORT_MODE_LABEL="(email-only - data read from existing consolidated CSV)"
+    DB_NAME=""
 
-write_sql_templates
-write_report_assets   # writes awk files + html templates into WORKDIR
-
-if [ "$CDB_MODE" = "YES" ]; then
-    REPORT_MODE_LABEL="CDB"
-    [ "$PDB_FILTER" != "ALL" ] && REPORT_MODE_LABEL="CDB (PDB=$PDB_FILTER)"
-    SQL_TO_RUN="$CDB_SQL"
-else
-    REPORT_MODE_LABEL="non-CDB"
-    SQL_TO_RUN="$NONCDB_SQL"
-fi
-
-# ---- Determine output file names (tag-based when -N given) ----
-if [ -n "$TAG" ]; then
     MASTER_TBSP_CSV="${OUTDIR}/${TAG}_tbsp_capacity.csv"
     MASTER_ASM_CSV="${OUTDIR}/${TAG}_asm_diskgroup.csv"
     HTML_OUT="${OUTDIR}/${TAG}_capacity_report.html"
-    RUNLOG_OUT="${OUTDIR}/${TAG}_$(date '+%Y%m%d_%H%M%S').log"
+    RUNLOG_OUT="${OUTDIR}/${TAG}_$(date '+%Y%m%d_%H%M%S')_emailonly.log"
+
+    if [ ! -f "$MASTER_TBSP_CSV" ]; then
+        die "No consolidated CSV found for tag '$TAG' at $MASTER_TBSP_CSV. Run the report generator (without -E) at least once for this tag before using -E." 2
+    fi
+
+    write_report_assets   # awk libs + html templates only - no SQL needed
+    info "Email-only mode: using existing $MASTER_TBSP_CSV"
+
 else
-    MASTER_TBSP_CSV="${OUTDIR}/${DB_LABEL}_tbsp_capacity_${RUN_TS}.csv"
-    MASTER_ASM_CSV="${OUTDIR}/${DB_LABEL}_asm_diskgroup_${RUN_TS}.csv"
-    HTML_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.html"
-    RUNLOG_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.log"
-fi
+    # -------------------------------------------------------------------
+    # Normal mode: connect to Oracle and (re)generate data for this DB.
+    # -------------------------------------------------------------------
+    if ! detect_db; then
+        die "Could not determine target database / CDB mode. Aborting." 2
+    fi
 
-# ---- Run tablespace query -> raw CSV -> add date -> merge into master ----
-TBSP_RAW="${WORKDIR}/tbsp_raw.csv"
-if ! run_sql_to_csv "$CONNECT_STR" "$SQL_TO_RUN" "$TBSP_RAW" "Tablespace capacity/growth"; then
-    die "Tablespace capacity/growth query failed. See log above. Nothing written to $OUTDIR." 3
-fi
-filter_pdb "$TBSP_RAW"
+    DB_LABEL=$(printf '%s' "$DB_NAME" | tr -c 'A-Za-z0-9' '_')
 
-TBSP_DATED="${WORKDIR}/tbsp_dated.csv"
-add_date_column "$TBSP_RAW" "$TBSP_DATED" "$TODAY"
-update_master_csv "$MASTER_TBSP_CSV" "$TBSP_DATED" "$TODAY" "$DB_NAME"
+    write_sql_templates
+    write_report_assets   # writes awk files + html templates into WORKDIR
 
-# ---- ASM query -> raw CSV -> add date+db_name -> merge into master ----
-ASM_OK=1; ASM_CSV_OUT=""
-if [ "$SKIP_ASM" -eq 1 ]; then
-    info "ASM diskgroup section skipped (-x)."
-else
-    ASM_RAW="${WORKDIR}/asm_raw.csv"
-    if run_asm_query "$ASM_RAW"; then
-        ASM_OK=0
-        ASM_DATED="${WORKDIR}/asm_dated.csv"
-        add_date_column "$ASM_RAW" "$ASM_DATED" "$TODAY" "$DB_NAME"
-        update_master_csv "$MASTER_ASM_CSV" "$ASM_DATED" "$TODAY" "$DB_NAME"
-        ASM_CSV_OUT="$MASTER_ASM_CSV"
+    if [ "$CDB_MODE" = "YES" ]; then
+        REPORT_MODE_LABEL="CDB"
+        [ "$PDB_FILTER" != "ALL" ] && REPORT_MODE_LABEL="CDB (PDB=$PDB_FILTER)"
+        SQL_TO_RUN="$CDB_SQL"
+    else
+        REPORT_MODE_LABEL="non-CDB"
+        SQL_TO_RUN="$NONCDB_SQL"
+    fi
+
+    # ---- Determine output file names (tag-based when -N given) ----
+    if [ -n "$TAG" ]; then
+        MASTER_TBSP_CSV="${OUTDIR}/${TAG}_tbsp_capacity.csv"
+        MASTER_ASM_CSV="${OUTDIR}/${TAG}_asm_diskgroup.csv"
+        HTML_OUT="${OUTDIR}/${TAG}_capacity_report.html"
+        RUNLOG_OUT="${OUTDIR}/${TAG}_$(date '+%Y%m%d_%H%M%S').log"
+    else
+        MASTER_TBSP_CSV="${OUTDIR}/${DB_LABEL}_tbsp_capacity_${RUN_TS}.csv"
+        MASTER_ASM_CSV="${OUTDIR}/${DB_LABEL}_asm_diskgroup_${RUN_TS}.csv"
+        HTML_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.html"
+        RUNLOG_OUT="${OUTDIR}/${DB_LABEL}_capacity_report_${RUN_TS}.log"
+    fi
+
+    # ---- Refuse to re-query a database already captured today under -N ----
+    # Only applies when -N is given (that's the consolidation/dedup case).
+    # Ad hoc runs without -N always proceed (each is its own timestamped
+    # file, nothing to collide with).
+    if [ -n "$TAG" ] && csv_has_today_db "$MASTER_TBSP_CSV" "$TODAY" "$DB_NAME"; then
+        warn "Database '$DB_NAME' already has data for $TODAY under tag '$TAG' in $MASTER_TBSP_CSV. Skipping the query - not re-populating the same database for the same day. (Delete that database's row(s) for today from the CSV, or use a different -N tag, if you really need to refresh it today.) The HTML report will still be (re)built from what's already there."
+        SKIP_QUERY=1
+    fi
+
+    if [ "$SKIP_QUERY" -eq 0 ]; then
+        # ---- Run tablespace query -> raw CSV -> add date -> merge into master ----
+        TBSP_RAW="${WORKDIR}/tbsp_raw.csv"
+        if ! run_sql_to_csv "$CONNECT_STR" "$SQL_TO_RUN" "$TBSP_RAW" "Tablespace capacity/growth"; then
+            die "Tablespace capacity/growth query failed. See log above. Nothing written to $OUTDIR." 3
+        fi
+        filter_pdb "$TBSP_RAW"
+
+        TBSP_DATED="${WORKDIR}/tbsp_dated.csv"
+        add_date_column "$TBSP_RAW" "$TBSP_DATED" "$TODAY"
+        update_master_csv "$MASTER_TBSP_CSV" "$TBSP_DATED" "$TODAY" "$DB_NAME"
+
+        # ---- ASM query -> raw CSV -> add date+db_name -> merge into master ----
+        if [ "$SKIP_ASM" -eq 1 ]; then
+            info "ASM diskgroup section skipped (-x)."
+        else
+            ASM_RAW="${WORKDIR}/asm_raw.csv"
+            if run_asm_query "$ASM_RAW"; then
+                ASM_DATED="${WORKDIR}/asm_dated.csv"
+                add_date_column "$ASM_RAW" "$ASM_DATED" "$TODAY" "$DB_NAME"
+                update_master_csv "$MASTER_ASM_CSV" "$ASM_DATED" "$TODAY" "$DB_NAME"
+            fi
+        fi
+    else
+        info "Skipping SQL query and ASM query for '$DB_NAME' (already have today's data). Regenerating HTML/email from the existing consolidated CSV(s)."
     fi
 fi
 
-# ---- Generate HTML from master CSVs ----
+# ===========================================================================
+# Generate HTML from master CSVs (shared by all three modes: normal query,
+# normal-but-skipped-query, and email-only)
+# ===========================================================================
 TS_TABS="${WORKDIR}/ts_tab_btns.html"
 TS_PANELS="${WORKDIR}/ts_panels.html"
 TS_CARDS="${WORKDIR}/ts_cards.html"
@@ -1413,7 +1530,7 @@ TS_SUMMARY="${WORKDIR}/ts_summary.txt"
 awk -v tabsfile="$TS_TABS" -v cardsfile="$TS_CARDS" \
     -v calloutfile="$TS_CALLOUT" -v summaryfile="$TS_SUMMARY" \
     -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_tabs.awk" \
-    "$MASTER_TBSP_CSV" > "$TS_PANELS"
+    "$MASTER_TBSP_CSV" > "$TS_PANELS" 2>>"$LOGFILE"
 
 TS_TOTAL=0; TS_RED=0; TS_AMBER=0; TS_GREEN=0; DB_COUNT=0
 TOP1=""; TOP2=""; TOP3=""
@@ -1432,15 +1549,24 @@ if [ -s "$TS_SUMMARY" ]; then
     done < "$TS_SUMMARY"
 fi
 
+# ASM_OK reflects whether the master ASM CSV actually has any data at all
+# (across every database/day recorded under this tag) - NOT just whether
+# this particular run's own ASM query succeeded. That matters once several
+# databases share one consolidated report: one database having no ASM data
+# (or this run skipping its query) must not hide every other database's
+# ASM tab.
 ASM_TABS="${WORKDIR}/asm_tab_btns.html"; : > "$ASM_TABS"
 ASM_PANELS="${WORKDIR}/asm_panels.html"; : > "$ASM_PANELS"
 ASM_CARDS="${WORKDIR}/asm_cards.html";  : > "$ASM_CARDS"
 ASM_SUMMARY="${WORKDIR}/asm_summary.txt"
 ASM_TOTAL=0; ASM_RED=0; ASM_AMBER=0; ASM_GREEN=0
-if [ "$ASM_OK" -eq 0 ]; then
+ASM_OK=1
+if [ -s "$MASTER_ASM_CSV" ]; then
+    ASM_OK=0
+    ASM_CSV_OUT="$MASTER_ASM_CSV"
     awk -v tabsfile="$ASM_TABS" -v cardsfile="$ASM_CARDS" -v summaryfile="$ASM_SUMMARY" \
         -f "${WORKDIR}/csvlib.awk" -f "${WORKDIR}/gen_asm_tabs.awk" \
-        "$MASTER_ASM_CSV" > "$ASM_PANELS"
+        "$MASTER_ASM_CSV" > "$ASM_PANELS" 2>>"$LOGFILE"
     if [ -s "$ASM_SUMMARY" ]; then
         while IFS='=' read -r _k _v; do
             case "$_k" in
@@ -1480,7 +1606,7 @@ awk -v rtag="$REPORT_TAG" -v gen="$RUN_TS_DISPLAY" -v ver="$SCRIPT_VERSION" '
         printf '<div class="tabs">\n'; cat "$ASM_TABS"; printf '</div>\n'
         cat "$ASM_PANELS"
     else
-        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">ASM data not available (database may use filesystem storage, query failed, or -x used). See the run log for details.</p>\n'
+        printf '<div class="section-h"><h2>ASM Diskgroups</h2></div>\n<p class="note">No ASM diskgroup data available yet for this tag (no database run so far has produced any, the query failed, or -x was used). See the run log for details.</p>\n'
     fi
     cat "${WORKDIR}/template_foot.html"
 } > "$HTML_OUT"
@@ -1489,7 +1615,9 @@ info "HTML report written: $HTML_OUT"
 # ---- Summary ----
 info "Tablespaces: $TS_TOTAL across $DB_COUNT DB(s) - RED=$TS_RED AMBER=$TS_AMBER GREEN=$TS_GREEN"
 [ "$ASM_OK" -eq 0 ] && info "ASM: $ASM_TOTAL diskgroup(s) - RED=$ASM_RED AMBER=$ASM_AMBER GREEN=$ASM_GREEN"
-[ "$ASM_OK" -ne 0 ] && [ "$SKIP_ASM" -eq 0 ] && EXIT_CODE=4
+if [ "$EMAIL_ONLY" -eq 0 ] && [ "$ASM_OK" -ne 0 ] && [ "$SKIP_ASM" -eq 0 ] && [ "$SKIP_QUERY" -eq 0 ]; then
+    EXIT_CODE=4
+fi
 
 # ---- Optional email: send today's slice of the master CSV ----
 MAIL_SENT=0
